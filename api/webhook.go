@@ -1,56 +1,11 @@
 package handler
 
 import (
-	"context"
-	"log/slog"
 	"net/http"
-	"os"
 
-	openaiadapter "github.com/Seraf-seraf/yanineko/internal/adapters/openai"
-	"github.com/Seraf-seraf/yanineko/internal/adapters/storage/sqlite"
-	"github.com/Seraf-seraf/yanineko/internal/adapters/telegram"
-	"github.com/Seraf-seraf/yanineko/internal/adapters/webhook"
-	"github.com/Seraf-seraf/yanineko/internal/app"
-	"github.com/Seraf-seraf/yanineko/internal/config"
-	"github.com/Seraf-seraf/yanineko/internal/domain"
+	vercelruntime "github.com/Seraf-seraf/yanineko/platform/vercel"
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	cfg, err := config.Load(os.Getenv)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "configuration unavailable", "phase", "config", "code", "config_invalid")
-		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	telegramClient, err := telegram.NewClient(cfg.TelegramBotToken, cfg.TelegramBotID)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "configuration unavailable", "phase", "config", "code", "config_invalid")
-		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	responder := openaiadapter.New(cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAIBaseURL)
-	handler := webhook.Handler{
-		Config:      cfg,
-		BotUsername: telegramClient.GetMe,
-		Process: func(ctx context.Context, incoming domain.Incoming) error {
-			store, err := sqlite.Open(ctx, cfg.TursoDatabaseURL, cfg.TursoAuthToken)
-			if err != nil {
-				return err
-			}
-			defer store.Close()
-			service := app.Service{
-				SystemPrompt: cfg.SystemPrompt,
-				Store:        store,
-				Responder:    responder,
-				Messenger:    telegramClient,
-			}
-			return service.Handle(ctx, incoming)
-		},
-	}
-	handler.ServeHTTP(w, r)
+	vercelruntime.Handler(w, r)
 }
