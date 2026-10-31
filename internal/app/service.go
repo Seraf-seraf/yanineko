@@ -32,7 +32,6 @@ const (
 	BeginSent
 	BeginBusy
 	BeginUnknown
-	BeginStale
 )
 
 type Claim struct {
@@ -106,7 +105,7 @@ func (s Service) Handle(ctx context.Context, incoming domain.Incoming) error {
 	switch result.Status {
 	case BeginBusy:
 		return ErrBusy
-	case BeginSent, BeginUnknown, BeginStale:
+	case BeginSent, BeginUnknown:
 		return nil
 	case BeginReady:
 		err = s.deliver(ctx, result.Claim.Incoming.UpdateID)

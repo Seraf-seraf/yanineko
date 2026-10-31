@@ -104,9 +104,12 @@ func TestPostgresStoreWithRealDriver(t *testing.T) {
 		t.Fatalf("same update with changed input error = %v, want ErrUpdateConflict", err)
 	}
 	older := sampleIncoming(99, 1, domain.MessageText, "late delivery")
-	stale, err := store.Begin(ctx, older, app.ConversationLeaseDuration)
-	if err != nil || stale.Status != app.BeginStale {
-		t.Fatalf("older update status = (%v, %v), want stale", stale.Status, err)
+	olderResult, err := store.Begin(ctx, older, app.ConversationLeaseDuration)
+	if err != nil || olderResult.Status != app.BeginClaimed {
+		t.Fatalf("unseen lower update identifier = (%v, %v), want claimed", olderResult.Status, err)
+	}
+	if err := store.Release(ctx, olderResult.Claim); err != nil {
+		t.Fatalf("release unseen lower update identifier: %v", err)
 	}
 
 	second := sampleIncoming(101, 1, domain.MessageText, "restored context")

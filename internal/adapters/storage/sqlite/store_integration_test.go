@@ -160,10 +160,13 @@ func TestSQLiteStoreWithRealDriver(t *testing.T) {
 		t.Fatalf("release update after expired delivery: %v", err)
 	}
 
-	older := sampleIncoming(99, 1, domain.MessageText, "late update")
-	stale, err := store.Begin(ctx, older, app.ConversationLeaseDuration)
-	if err != nil || stale.Status != app.BeginStale {
-		t.Fatalf("old update status = (%v, %v), want stale", stale.Status, err)
+	older := sampleIncoming(99, 1, domain.MessageText, "lower update identifier")
+	olderResult, err := store.Begin(ctx, older, app.ConversationLeaseDuration)
+	if err != nil || olderResult.Status != app.BeginClaimed {
+		t.Fatalf("unseen lower update identifier = (%v, %v), want claimed", olderResult.Status, err)
+	}
+	if err := store.Release(ctx, olderResult.Claim); err != nil {
+		t.Fatalf("release unseen lower update identifier: %v", err)
 	}
 
 	testConcurrentSQLiteUpdates(t, ctx, store)

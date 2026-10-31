@@ -45,11 +45,10 @@ type transaction struct {
 }
 
 type conversationRecord struct {
-	Version      int64
-	LastUpdateID int64
-	LeaseOwner   sql.NullString
-	LeaseUntil   sql.NullFloat64
-	Now          float64
+	Version    int64
+	LeaseOwner sql.NullString
+	LeaseUntil sql.NullFloat64
+	Now        float64
 }
 
 type updateRecord struct {
@@ -271,7 +270,6 @@ func (s *Store) Begin(ctx context.Context, incoming domain.Incoming, leaseDurati
 			}
 			return result, nil
 		}
-		conversation.LastUpdateID = max(conversation.LastUpdateID, pending.UpdateID)
 	}
 	remaining, err := loadPending(ctx, tx, incoming.Key, incoming.UpdateID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -282,12 +280,6 @@ func (s *Store) Begin(ctx context.Context, incoming domain.Incoming, leaseDurati
 			return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
 		}
 		return app.BeginResult{Status: app.BeginBusy, Claim: claimFromRecord(remaining)}, nil
-	}
-	if incoming.UpdateID <= conversation.LastUpdateID {
-		if err := tx.Commit(ctx); err != nil {
-			return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
-		}
-		return app.BeginResult{Status: app.BeginStale, Claim: claimFromIncoming(incoming, "", conversation.Version)}, nil
 	}
 	if leaseActive(conversation) {
 		return app.BeginResult{Status: app.BeginBusy}, nil
@@ -746,9 +738,9 @@ func cleanupStale(ctx context.Context, tx *transaction) error {
 func loadConversation(ctx context.Context, tx *transaction, key domain.ConversationKey) (conversationRecord, error) {
 	var record conversationRecord
 	err := tx.QueryRowContext(ctx, `
-		SELECT version, last_update_id, lease_owner, lease_until, julianday('now')
+		SELECT version, lease_owner, lease_until, julianday('now')
 		FROM conversations WHERE chat_id = ? AND thread_id = ?`, key.ChatID, key.ThreadID).Scan(
-		&record.Version, &record.LastUpdateID, &record.LeaseOwner, &record.LeaseUntil, &record.Now)
+		&record.Version, &record.LeaseOwner, &record.LeaseUntil, &record.Now)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return conversationRecord{}, ErrUpdateNotFound

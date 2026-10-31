@@ -42,11 +42,10 @@ type Store struct {
 }
 
 type conversationRecord struct {
-	Version      int64
-	LastUpdateID int64
-	LeaseOwner   pgtype.Text
-	LeaseUntil   pgtype.Timestamptz
-	Now          time.Time
+	Version    int64
+	LeaseOwner pgtype.Text
+	LeaseUntil pgtype.Timestamptz
+	Now        time.Time
 }
 
 type updateRecord struct {
@@ -212,7 +211,6 @@ func (s *Store) Begin(ctx context.Context, incoming domain.Incoming, leaseDurati
 			}
 			return result, nil
 		}
-		conversation.LastUpdateID = max(conversation.LastUpdateID, pending.UpdateID)
 	}
 	remaining, pendingErr := lockPending(ctx, tx, incoming.Key, incoming.UpdateID)
 	if pendingErr != nil && !errors.Is(pendingErr, pgx.ErrNoRows) {
@@ -225,12 +223,6 @@ func (s *Store) Begin(ctx context.Context, incoming domain.Incoming, leaseDurati
 		return app.BeginResult{Status: app.BeginBusy, Claim: claimFromRecord(remaining)}, nil
 	}
 
-	if incoming.UpdateID <= conversation.LastUpdateID {
-		if err := tx.Commit(ctx); err != nil {
-			return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
-		}
-		return app.BeginResult{Status: app.BeginStale, Claim: claimFromIncoming(incoming, "", conversation.Version)}, nil
-	}
 	if leaseActive(conversation) {
 		return app.BeginResult{Status: app.BeginBusy}, nil
 	}
@@ -745,11 +737,11 @@ func (s *Store) cleanupStale(ctx context.Context) error {
 func lockConversation(ctx context.Context, tx pgx.Tx, key domain.ConversationKey) (conversationRecord, error) {
 	var record conversationRecord
 	err := tx.QueryRow(ctx, `
-		SELECT version, last_update_id, lease_owner, lease_until, clock_timestamp()
+		SELECT version, lease_owner, lease_until, clock_timestamp()
 		FROM conversations
 		WHERE chat_id = $1 AND thread_id = $2
 		FOR UPDATE`, key.ChatID, key.ThreadID).Scan(
-		&record.Version, &record.LastUpdateID, &record.LeaseOwner, &record.LeaseUntil, &record.Now,
+		&record.Version, &record.LeaseOwner, &record.LeaseUntil, &record.Now,
 	)
 	if err != nil {
 		return conversationRecord{}, databaseError(ctx, err, ErrDatabaseOperation)
