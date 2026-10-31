@@ -202,7 +202,7 @@ func (s *Store) Begin(ctx context.Context, incoming domain.Incoming, leaseDurati
 		if errors.Is(pendingErr, pgx.ErrNoRows) {
 			break
 		}
-		result, done, pendingErr := s.beginEarlierPending(ctx, tx, conversation, pending, owner, leaseDuration)
+		result, done, pendingErr := s.beginEarlierPending(ctx, tx, &conversation, pending, owner, leaseDuration)
 		if pendingErr != nil {
 			return app.BeginResult{}, pendingErr
 		}
@@ -679,11 +679,11 @@ func (s *Store) beginExisting(ctx context.Context, tx pgx.Tx, conversation conve
 	}
 }
 
-func (s *Store) beginEarlierPending(ctx context.Context, tx pgx.Tx, conversation conversationRecord, update updateRecord, owner string, leaseDuration time.Duration) (app.BeginResult, bool, error) {
+func (s *Store) beginEarlierPending(ctx context.Context, tx pgx.Tx, conversation *conversationRecord, update updateRecord, owner string, leaseDuration time.Duration) (app.BeginResult, bool, error) {
 	claim := claimFromRecord(update)
 	switch update.State {
 	case "processing":
-		if leaseActive(conversation) {
+		if leaseActive(*conversation) {
 			return app.BeginResult{Status: app.BeginBusy, Claim: claim}, true, nil
 		}
 		version := conversation.Version + 1
@@ -706,6 +706,19 @@ func (s *Store) beginEarlierPending(ctx context.Context, tx pgx.Tx, conversation
 		}
 		if err := markUnknownTx(ctx, tx, update); err != nil {
 			return app.BeginResult{}, false, err
+		}
+		key := domain.ConversationKey{ChatID: update.ChatID, ThreadID: update.ThreadID}
+		releaseErr := releaseConversation(ctx, tx, key, update.ProcessingOwner, update.ProcessingVersion)
+		if releaseErr != nil && !errors.Is(releaseErr, ErrLeaseLost) {
+			return app.BeginResult{}, false, releaseErr
+		}
+		refreshed, err := lockConversation(ctx, tx, key)
+		if err != nil {
+			return app.BeginResult{}, false, err
+		}
+		*conversation = refreshed
+		if errors.Is(releaseErr, ErrLeaseLost) && leaseActive(*conversation) {
+			return app.BeginResult{Status: app.BeginBusy}, true, nil
 		}
 		return app.BeginResult{}, false, nil
 	default:
@@ -811,7 +824,8 @@ func releaseConversation(ctx context.Context, tx pgx.Tx, key domain.Conversation
 func markUnknownTx(ctx context.Context, tx pgx.Tx, update updateRecord) error {
 	result, err := tx.Exec(ctx, `
 		UPDATE processed_updates
-		SET state = 'delivery_unknown', delivery_lease_until = NULL, updated_at = clock_timestamp()
+		SET state = 'delivery_unknown', delivery_owner = NULL,
+		    delivery_lease_until = NULL, updated_at = clock_timestamp()
 		WHERE update_id = $1 AND state = 'sending'`, update.UpdateID)
 	if err != nil {
 		return databaseError(ctx, err, ErrDatabaseOperation)

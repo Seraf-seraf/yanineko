@@ -261,7 +261,7 @@ func (s *Store) Begin(ctx context.Context, incoming domain.Incoming, leaseDurati
 		if pendingErr != nil {
 			return app.BeginResult{}, databaseError(ctx, pendingErr, ErrDatabaseOperation)
 		}
-		result, done, pendingErr := s.beginEarlierPending(ctx, tx, conversation, pending, owner, leaseDuration)
+		result, done, pendingErr := s.beginEarlierPending(ctx, tx, &conversation, pending, owner, leaseDuration)
 		if pendingErr != nil {
 			return app.BeginResult{}, pendingErr
 		}
@@ -680,11 +680,11 @@ func (s *Store) beginExisting(ctx context.Context, tx *transaction, conversation
 	}
 }
 
-func (s *Store) beginEarlierPending(ctx context.Context, tx *transaction, conversation conversationRecord, update updateRecord, owner string, leaseDuration time.Duration) (app.BeginResult, bool, error) {
+func (s *Store) beginEarlierPending(ctx context.Context, tx *transaction, conversation *conversationRecord, update updateRecord, owner string, leaseDuration time.Duration) (app.BeginResult, bool, error) {
 	claim := claimFromRecord(update)
 	switch update.State {
 	case "processing":
-		if leaseActive(conversation) {
+		if leaseActive(*conversation) {
 			return app.BeginResult{Status: app.BeginBusy, Claim: claim}, true, nil
 		}
 		version := conversation.Version + 1
@@ -708,6 +708,19 @@ func (s *Store) beginEarlierPending(ctx context.Context, tx *transaction, conver
 		}
 		if err := markUnknownTx(ctx, tx, update); err != nil {
 			return app.BeginResult{}, false, err
+		}
+		key := domain.ConversationKey{ChatID: update.ChatID, ThreadID: update.ThreadID}
+		releaseErr := releaseConversation(ctx, tx, key, update.ProcessingOwner, update.ProcessingVersion)
+		if releaseErr != nil && !errors.Is(releaseErr, ErrLeaseLost) {
+			return app.BeginResult{}, false, releaseErr
+		}
+		refreshed, err := loadConversation(ctx, tx, key)
+		if err != nil {
+			return app.BeginResult{}, false, err
+		}
+		*conversation = refreshed
+		if errors.Is(releaseErr, ErrLeaseLost) && leaseActive(*conversation) {
+			return app.BeginResult{Status: app.BeginBusy}, true, nil
 		}
 		return app.BeginResult{}, false, nil
 	default:
@@ -822,7 +835,8 @@ func releaseConversation(ctx context.Context, tx *transaction, key domain.Conver
 func markUnknownTx(ctx context.Context, tx *transaction, update updateRecord) error {
 	result, err := tx.ExecContext(ctx, `
 		UPDATE processed_updates
-		SET state = 'delivery_unknown', delivery_lease_until = NULL, updated_at = julianday('now')
+		SET state = 'delivery_unknown', delivery_owner = NULL,
+		    delivery_lease_until = NULL, updated_at = julianday('now')
 		WHERE update_id = ? AND state = 'sending'`, update.UpdateID)
 	if err != nil {
 		return databaseError(ctx, err, ErrDatabaseOperation)

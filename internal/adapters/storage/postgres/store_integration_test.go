@@ -157,6 +157,45 @@ func TestPostgresStoreWithRealDriver(t *testing.T) {
 	}
 	if retryClaim := beginClaimed(t, ctx, store, staleInput); retryClaim.Version <= newClaim.Version {
 		t.Fatalf("released update version = %d, want > %d", retryClaim.Version, newClaim.Version)
+	} else if err := store.Release(ctx, retryClaim); err != nil {
+		t.Fatalf("release retried fencing claim: %v", err)
+	}
+
+	expired := sampleIncoming(104, 1, domain.MessageAbout, "/about")
+	expiredClaim := beginClaimed(t, ctx, store, expired)
+	if err := store.CommitAbout(ctx, expiredClaim, app.AboutMessage); err != nil {
+		t.Fatalf("commit response before expired delivery: %v", err)
+	}
+	expiredDelivery, err := store.ClaimDelivery(ctx, expired.UpdateID, app.DeliveryLeaseDuration)
+	if err != nil || expiredDelivery.Status != app.DeliveryClaimed {
+		t.Fatalf("claim expiring delivery = (%v, %v), want claimed", expiredDelivery.Status, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE processed_updates SET delivery_lease_until = clock_timestamp() - interval '1 second' WHERE update_id = $1`, expired.UpdateID); err != nil {
+		t.Fatalf("expire delivery lease: %v", err)
+	}
+	var conversationLeaseActive bool
+	if err := store.pool.QueryRow(ctx, `SELECT lease_until > clock_timestamp() FROM conversations WHERE chat_id = $1 AND thread_id = $2`, expired.Key.ChatID, expired.Key.ThreadID).Scan(&conversationLeaseActive); err != nil || !conversationLeaseActive {
+		t.Fatalf("processing lease active before delivery recovery = (%v, %v), want true", conversationLeaseActive, err)
+	}
+
+	afterExpired := sampleIncoming(105, 1, domain.MessageText, "after uncertain delivery")
+	afterExpiredResult, err := store.Begin(ctx, afterExpired, app.ConversationLeaseDuration)
+	if err != nil || afterExpiredResult.Status != app.BeginClaimed {
+		t.Fatalf("update after expired delivery = (%v, %v), want claimed", afterExpiredResult.Status, err)
+	}
+	var deliveryState string
+	var deliveryOwnerNull, deliveryLeaseNull bool
+	if err := store.pool.QueryRow(ctx, `SELECT state, delivery_owner IS NULL, delivery_lease_until IS NULL FROM processed_updates WHERE update_id = $1`, expired.UpdateID).Scan(&deliveryState, &deliveryOwnerNull, &deliveryLeaseNull); err != nil {
+		t.Fatalf("read expired delivery state: %v", err)
+	}
+	if deliveryState != "delivery_unknown" || !deliveryOwnerNull || !deliveryLeaseNull {
+		t.Fatalf("expired delivery fields = (%q, owner null %v, lease null %v), want unknown with no lease owner", deliveryState, deliveryOwnerNull, deliveryLeaseNull)
+	}
+	if err := store.MarkSent(ctx, expiredDelivery.Delivery, 704); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("late completion of expired delivery = %v, want ErrLeaseLost", err)
+	}
+	if err := store.Release(ctx, afterExpiredResult.Claim); err != nil {
+		t.Fatalf("release update after expired delivery: %v", err)
 	}
 
 	testConcurrentConversations(t, ctx, store)

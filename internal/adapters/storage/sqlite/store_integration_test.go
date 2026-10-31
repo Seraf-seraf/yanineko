@@ -122,6 +122,44 @@ func TestSQLiteStoreWithRealDriver(t *testing.T) {
 		t.Fatalf("release fenced claim: %v", err)
 	}
 
+	expired := sampleIncoming(104, 1, domain.MessageAbout, "/about")
+	expiredClaim := beginClaimed(t, ctx, store, expired)
+	if err := store.CommitAbout(ctx, expiredClaim, app.AboutMessage); err != nil {
+		t.Fatalf("commit response before expired delivery: %v", err)
+	}
+	expiredDelivery, err := store.ClaimDelivery(ctx, expired.UpdateID, app.DeliveryLeaseDuration)
+	if err != nil || expiredDelivery.Status != app.DeliveryClaimed {
+		t.Fatalf("claim expiring delivery = (%v, %v), want claimed", expiredDelivery.Status, err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE processed_updates SET delivery_lease_until = julianday('now') - 1 WHERE update_id = ?`, expired.UpdateID); err != nil {
+		t.Fatalf("expire delivery lease: %v", err)
+	}
+	var conversationLeaseActive bool
+	if err := store.db.QueryRowContext(ctx, `SELECT lease_until > julianday('now') FROM conversations WHERE chat_id = ? AND thread_id = ?`, expired.Key.ChatID, expired.Key.ThreadID).Scan(&conversationLeaseActive); err != nil || !conversationLeaseActive {
+		t.Fatalf("processing lease active before delivery recovery = (%v, %v), want true", conversationLeaseActive, err)
+	}
+
+	afterExpired := sampleIncoming(105, 1, domain.MessageText, "after uncertain delivery")
+	afterExpiredResult, err := store.Begin(ctx, afterExpired, app.ConversationLeaseDuration)
+	if err != nil || afterExpiredResult.Status != app.BeginClaimed {
+		t.Fatalf("update after expired delivery = (%v, %v), want claimed", afterExpiredResult.Status, err)
+	}
+	var deliveryState string
+	var deliveryOwner sql.NullString
+	var deliveryLease sql.NullFloat64
+	if err := store.db.QueryRowContext(ctx, `SELECT state, delivery_owner, delivery_lease_until FROM processed_updates WHERE update_id = ?`, expired.UpdateID).Scan(&deliveryState, &deliveryOwner, &deliveryLease); err != nil {
+		t.Fatalf("read expired delivery state: %v", err)
+	}
+	if deliveryState != "delivery_unknown" || deliveryOwner.Valid || deliveryLease.Valid {
+		t.Fatalf("expired delivery fields = (%q, %v, %v), want unknown with no lease owner", deliveryState, deliveryOwner, deliveryLease)
+	}
+	if err := store.MarkSent(ctx, expiredDelivery.Delivery, 704); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("late completion of expired delivery = %v, want ErrLeaseLost", err)
+	}
+	if err := store.Release(ctx, afterExpiredResult.Claim); err != nil {
+		t.Fatalf("release update after expired delivery: %v", err)
+	}
+
 	older := sampleIncoming(99, 1, domain.MessageText, "late update")
 	stale, err := store.Begin(ctx, older, app.ConversationLeaseDuration)
 	if err != nil || stale.Status != app.BeginStale {
