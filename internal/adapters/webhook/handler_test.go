@@ -1,0 +1,237 @@
+package webhook
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"net/http"
+	"net/http/httptest"
+
+	"github.com/Seraf-seraf/yanineko/internal/config"
+	"github.com/Seraf-seraf/yanineko/internal/domain"
+)
+
+func TestServeHTTPMethodAndSecret(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		method     string
+		secret     string
+		wantStatus int
+	}{
+		{name: "method", method: http.MethodGet, secret: "valid_secret", wantStatus: http.StatusMethodNotAllowed},
+		{name: "missing secret", method: http.MethodPost, wantStatus: http.StatusUnauthorized},
+		{name: "wrong secret", method: http.MethodPost, secret: "wrong_secret", wantStatus: http.StatusUnauthorized},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			handler := Handler{Config: testConfig()}
+			request := httptest.NewRequest(test.method, "/api/webhook", strings.NewReader(`{"update_id":1,"message":{}}`))
+			if test.secret != "" {
+				request.Header.Set("X-Telegram-Bot-Api-Secret-Token", test.secret)
+			}
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+			if test.method == http.MethodGet && response.Header().Get("Allow") != http.MethodPost {
+				t.Fatalf("Allow = %q, want POST", response.Header().Get("Allow"))
+			}
+		})
+	}
+}
+
+func TestServeHTTPRejectsOversizedAndMalformedBodies(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{name: "malformed JSON", body: `{`, wantStatus: http.StatusBadRequest},
+		{name: "multiple event fields", body: `{"update_id":1,"message":{},"edited_message":{}}`, wantStatus: http.StatusBadRequest},
+		{name: "oversized body", body: fmt.Sprintf(`{"update_id":1,"event":"%s"}`, strings.Repeat("x", int(MaxBodyBytes))), wantStatus: http.StatusRequestEntityTooLarge},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			request := authenticatedRequest(test.body)
+			response := httptest.NewRecorder()
+			Handler{Config: testConfig()}.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+		})
+	}
+}
+
+func TestServeHTTPIgnoresUnsupportedAndUnaddressedUpdates(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "edited message", body: `{"update_id":1,"edited_message":{"message_id":1}}`},
+		{name: "channel post", body: `{"update_id":2,"channel_post":{"message_id":1}}`},
+		{name: "unaddressed group", body: messageJSON(3, "group", "hello", "", false, false)},
+		{name: "bot message", body: messageJSON(4, "private", "hello", "", true, false)},
+		{name: "non-text update", body: `{"update_id":5,"message":{"message_id":1,"chat":{"id":1,"type":"private"},"from":{"id":2,"is_bot":false},"photo":[{}]}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			calls := 0
+			handler := Handler{
+				Config: testConfig(),
+				Process: func(context.Context, domain.Incoming) error {
+					calls++
+					return nil
+				},
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, authenticatedRequest(test.body))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", response.Code)
+			}
+			if calls != 0 {
+				t.Fatalf("processor calls = %d, want 0", calls)
+			}
+		})
+	}
+}
+
+func TestServeHTTPDispatchesPrivateTextAndGroupMentionOrReply(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		body        string
+		username    string
+		wantProfile bool
+	}{
+		{name: "private text", body: messageJSON(10, "private", "hello", "", false, false)},
+		{name: "group mention", body: `{"update_id":11,"message":{"message_id":10,"chat":{"id":-42,"type":"supergroup"},"from":{"id":7,"is_bot":false},"text":"😀 Привет @yanineko","entities":[{"type":"mention","offset":10,"length":9}]}}`, username: "yanineko", wantProfile: true},
+		{name: "reply to bot", body: messageJSON(12, "group", "reply text", "bot", false, true)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			profileCalls, processCalls := 0, 0
+			var got domain.Incoming
+			handler := Handler{
+				Config: testConfig(),
+				BotUsername: func(context.Context) (string, error) {
+					profileCalls++
+					return test.username, nil
+				},
+				Process: func(_ context.Context, incoming domain.Incoming) error {
+					processCalls++
+					got = incoming
+					return nil
+				},
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, authenticatedRequest(test.body))
+			if response.Code != http.StatusOK || processCalls != 1 {
+				t.Fatalf("status/calls = %d/%d, want 200/1", response.Code, processCalls)
+			}
+			if (profileCalls == 1) != test.wantProfile {
+				t.Fatalf("profile calls = %d, wantProfile = %t", profileCalls, test.wantProfile)
+			}
+			if got.Kind != domain.MessageText {
+				t.Fatalf("incoming kind = %d, want text", got.Kind)
+			}
+		})
+	}
+}
+
+func TestServeHTTPDispatchesAboutAndIgnoresOtherBotCommand(t *testing.T) {
+	t.Parallel()
+
+	about := `{"update_id":20,"message":{"message_id":12,"chat":{"id":-42,"type":"group"},"from":{"id":7,"is_bot":false},"text":"/about@yanineko","entities":[{"type":"bot_command","offset":0,"length":15}]}}`
+	otherBot := `{"update_id":21,"message":{"message_id":13,"chat":{"id":9,"type":"private"},"from":{"id":7,"is_bot":false},"text":"/about@otherbot","entities":[{"type":"bot_command","offset":0,"length":15}]}}`
+
+	for _, test := range []struct {
+		name      string
+		body      string
+		wantCalls int
+		wantKind  domain.MessageKind
+	}{
+		{name: "about", body: about, wantCalls: 1, wantKind: domain.MessageAbout},
+		{name: "other bot", body: otherBot},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			handler := Handler{
+				Config:      testConfig(),
+				BotUsername: func(context.Context) (string, error) { return "yanineko", nil },
+				Process: func(_ context.Context, incoming domain.Incoming) error {
+					calls++
+					if incoming.Kind != test.wantKind {
+						t.Fatalf("incoming kind = %d, want %d", incoming.Kind, test.wantKind)
+					}
+					return nil
+				},
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, authenticatedRequest(test.body))
+			if response.Code != http.StatusOK || calls != test.wantCalls {
+				t.Fatalf("status/calls = %d/%d, want 200/%d", response.Code, calls, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestServeHTTPReturnsRetryableErrorWhenProcessingFails(t *testing.T) {
+	t.Parallel()
+
+	handler := Handler{
+		Config: testConfig(),
+		Process: func(context.Context, domain.Incoming) error {
+			return errors.New("internal details")
+		},
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authenticatedRequest(messageJSON(30, "private", "hello", "", false, false)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+	if strings.Contains(response.Body.String(), "internal details") {
+		t.Fatalf("response leaked internal error: %q", response.Body.String())
+	}
+}
+
+func authenticatedRequest(body string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, "/api/webhook", strings.NewReader(body))
+	request.Header.Set("X-Telegram-Bot-Api-Secret-Token", "valid_secret")
+	return request
+}
+
+func testConfig() config.Config {
+	return config.Config{TelegramBotID: 123456789, TelegramWebhookSecret: "valid_secret"}
+}
+
+func messageJSON(updateID int64, chatType, text, replyType string, isBot, replyToBot bool) string {
+	chatID := int64(7)
+	if chatType == "group" {
+		chatID = -42
+		chatType = "supergroup"
+	}
+	reply := ""
+	if replyToBot {
+		reply = `,"reply_to_message":{"from":{"id":123456789,"is_bot":true}}`
+	} else if replyType != "" {
+		reply = `,"reply_to_message":{"from":{"id":42,"is_bot":true}}`
+	}
+	return fmt.Sprintf(`{"update_id":%d,"message":{"message_id":10,"chat":{"id":%d,"type":"%s"},"from":{"id":7,"is_bot":%t},"text":%q%s}}`, updateID, chatID, chatType, isBot, text, reply)
+}

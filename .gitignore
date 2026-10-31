@@ -1,0 +1,38 @@
+# Local episode videos
+*.mkv
+*.mp4
+*.m4v
+*.mov
+*.avi
+*.webm
+*.mpeg
+*.mpg
+*.m2ts
+*.mts
+*.wmv
+*.flv
+*.3gp
+*.ogv
+
+# Subtitle files and subtitle source directory
+/subtitles/
+*.srt
+*.ass
+*.ssa
+*.vtt
+*.sub
+*.idx
+*.sup
+*.ttml
+*.dfxp
+
+# Local environment and Vercel files
+.env
+.env.*
+!.env.example
+.vercel/
+
+# Go build and coverage output
+/bin/
+*.test
+coverage.out

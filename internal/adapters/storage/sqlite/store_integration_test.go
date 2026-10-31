@@ -1,0 +1,283 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	_ "turso.tech/database/tursogo"
+
+	"github.com/Seraf-seraf/yanineko/internal/app"
+	"github.com/Seraf-seraf/yanineko/internal/domain"
+)
+
+func TestSQLiteStoreWithRealDriver(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("turso", ":memory:")
+	if err != nil {
+		t.Fatalf("open in-memory SQLite-compatible database: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		t.Fatalf("ping in-memory SQLite-compatible database: %v", err)
+	}
+	store := newStore(db)
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("run SQLite migrations: %v", err)
+	}
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("re-run existing SQLite migrations: %v", err)
+	}
+
+	first := sampleIncoming(100, 1, domain.MessageText, "first")
+	claim := beginClaimed(t, ctx, store, first)
+	if history, err := store.History(ctx, claim); err != nil || len(history) != 0 {
+		t.Fatalf("initial history = (%#v, %v), want empty", history, err)
+	}
+	duplicate, err := store.Begin(ctx, first, app.ConversationLeaseDuration)
+	if err != nil || duplicate.Status != app.BeginBusy {
+		t.Fatalf("duplicate while processing = (%v, %v), want busy", duplicate.Status, err)
+	}
+	if err := store.CommitResponse(ctx, claim, "first reply"); err != nil {
+		t.Fatalf("atomically commit response and history: %v", err)
+	}
+	duplicate, err = store.Begin(ctx, first, app.ConversationLeaseDuration)
+	if err != nil || duplicate.Status != app.BeginReady {
+		t.Fatalf("duplicate after generation = (%v, %v), want ready", duplicate.Status, err)
+	}
+	delivery, err := store.ClaimDelivery(ctx, first.UpdateID, app.DeliveryLeaseDuration)
+	if err != nil || delivery.Status != app.DeliveryClaimed {
+		t.Fatalf("claim first delivery = (%v, %v), want claimed", delivery.Status, err)
+	}
+	if err := store.MarkSent(ctx, delivery.Delivery, 700); err != nil {
+		t.Fatalf("mark first delivery sent: %v", err)
+	}
+	duplicate, err = store.Begin(ctx, first, app.ConversationLeaseDuration)
+	if err != nil || duplicate.Status != app.BeginSent {
+		t.Fatalf("duplicate after delivery = (%v, %v), want sent", duplicate.Status, err)
+	}
+	conflicting := first
+	conflicting.Text = "conflicting duplicate"
+	if _, err := store.Begin(ctx, conflicting, app.ConversationLeaseDuration); !errors.Is(err, ErrUpdateConflict) {
+		t.Fatalf("duplicate update with different content error = %v, want ErrUpdateConflict", err)
+	}
+
+	second := sampleIncoming(101, 1, domain.MessageText, "restored")
+	secondClaim := beginClaimed(t, ctx, store, second)
+	history, err := store.History(ctx, secondClaim)
+	if err != nil || len(history) != 2 || history[0].Text != first.Text || history[1].Text != "first reply" {
+		t.Fatalf("restored history = (%#v, %v), want persisted user/assistant pair", history, err)
+	}
+	if err := store.Release(ctx, secondClaim); err != nil {
+		t.Fatalf("release pre-generation claim: %v", err)
+	}
+	secondClaim = beginClaimed(t, ctx, store, second)
+	if err := store.Release(ctx, secondClaim); err != nil {
+		t.Fatalf("release retry before generation: %v", err)
+	}
+
+	about := sampleIncoming(102, 1, domain.MessageAbout, "/about")
+	aboutClaim := beginClaimed(t, ctx, store, about)
+	if err := store.CommitAbout(ctx, aboutClaim, app.AboutMessage); err != nil {
+		t.Fatalf("commit static about response: %v", err)
+	}
+	aboutDelivery, err := store.ClaimDelivery(ctx, about.UpdateID, app.DeliveryLeaseDuration)
+	if err != nil || aboutDelivery.Status != app.DeliveryClaimed {
+		t.Fatalf("claim about delivery = (%v, %v), want claimed", aboutDelivery.Status, err)
+	}
+	if err := store.MarkDeliveryUnknown(ctx, aboutDelivery.Delivery); err != nil {
+		t.Fatalf("persist unknown about delivery: %v", err)
+	}
+	duplicate, err = store.Begin(ctx, about, app.ConversationLeaseDuration)
+	if err != nil || duplicate.Status != app.BeginUnknown {
+		t.Fatalf("unknown duplicate = (%v, %v), want unknown", duplicate.Status, err)
+	}
+	unknown, err := store.ClaimDelivery(ctx, about.UpdateID, app.DeliveryLeaseDuration)
+	if err != nil || unknown.Status != app.DeliveryUnknownState {
+		t.Fatalf("unknown delivery retry = (%v, %v), want no resend", unknown.Status, err)
+	}
+
+	fenced := sampleIncoming(103, 1, domain.MessageText, "fencing")
+	oldClaim := beginClaimed(t, ctx, store, fenced)
+	if _, err := store.db.ExecContext(ctx, `UPDATE conversations SET lease_until = julianday('now') - 1 WHERE chat_id = ? AND thread_id = ?`, fenced.Key.ChatID, fenced.Key.ThreadID); err != nil {
+		t.Fatalf("expire SQLite lease: %v", err)
+	}
+	newClaim := beginClaimed(t, ctx, store, fenced)
+	if newClaim.Version <= oldClaim.Version || newClaim.OwnerToken == oldClaim.OwnerToken {
+		t.Fatalf("reclaimed fencing token = (%d, %q), old = (%d, %q)", newClaim.Version, newClaim.OwnerToken, oldClaim.Version, oldClaim.OwnerToken)
+	}
+	if err := store.CommitResponse(ctx, oldClaim, "stale response"); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale response commit error = %v, want ErrLeaseLost", err)
+	}
+	if err := store.Release(ctx, newClaim); err != nil {
+		t.Fatalf("release fenced claim: %v", err)
+	}
+
+	older := sampleIncoming(99, 1, domain.MessageText, "late update")
+	stale, err := store.Begin(ctx, older, app.ConversationLeaseDuration)
+	if err != nil || stale.Status != app.BeginStale {
+		t.Fatalf("old update status = (%v, %v), want stale", stale.Status, err)
+	}
+
+	testConcurrentSQLiteUpdates(t, ctx, store)
+	testConcurrentSQLiteConversations(t, ctx, store)
+	testSQLiteContextLimitAndIsolation(t, ctx, store)
+
+	var aboutHistoryCount int64
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM conversation_messages WHERE chat_id = ? AND thread_id = ? AND update_id = ?`, about.Key.ChatID, about.Key.ThreadID, about.UpdateID).Scan(&aboutHistoryCount); err != nil {
+		t.Fatalf("count about context rows: %v", err)
+	}
+	if aboutHistoryCount != 0 {
+		t.Fatalf("about history rows = %d, want zero", aboutHistoryCount)
+	}
+}
+
+func testConcurrentSQLiteUpdates(t *testing.T, ctx context.Context, store *Store) {
+	t.Helper()
+	inputs := []domain.Incoming{
+		sampleIncoming(200, 2, domain.MessageText, "concurrent first"),
+		sampleIncoming(201, 2, domain.MessageText, "concurrent second"),
+	}
+	start := make(chan struct{})
+	results := make([]app.BeginResult, len(inputs))
+	errorsFound := make([]error, len(inputs))
+	var waitGroup sync.WaitGroup
+	for index, input := range inputs {
+		waitGroup.Add(1)
+		go func(index int, input domain.Incoming) {
+			defer waitGroup.Done()
+			<-start
+			results[index], errorsFound[index] = store.Begin(ctx, input, app.ConversationLeaseDuration)
+		}(index, input)
+	}
+	close(start)
+	waitGroup.Wait()
+	statuses := make([]app.BeginStatus, len(results))
+	claimedResult := app.BeginResult{}
+	for index, result := range results {
+		if err := errorsFound[index]; err != nil {
+			t.Fatalf("concurrent SQLite begin: %v", err)
+		}
+		statuses[index] = result.Status
+		if result.Status == app.BeginClaimed {
+			claimedResult = result
+		}
+	}
+	claimed, busy := 0, 0
+	for _, status := range statuses {
+		if status == app.BeginClaimed {
+			claimed++
+		}
+		if status == app.BeginBusy {
+			busy++
+		}
+	}
+	if claimed != 1 || busy != 1 {
+		t.Fatalf("same-chat SQLite statuses = %v, want one claimed and one busy", statuses)
+	}
+	if err := store.Release(ctx, claimedResult.Claim); err != nil {
+		t.Fatalf("release same-chat SQLite claim: %v", err)
+	}
+}
+
+func testConcurrentSQLiteConversations(t *testing.T, ctx context.Context, store *Store) {
+	t.Helper()
+	inputs := []domain.Incoming{
+		sampleIncoming(300, 3, domain.MessageText, "independent first"),
+		sampleIncoming(301, 4, domain.MessageText, "independent second"),
+	}
+	start := make(chan struct{})
+	results := make([]app.BeginResult, len(inputs))
+	errorsFound := make([]error, len(inputs))
+	var waitGroup sync.WaitGroup
+	for index, input := range inputs {
+		waitGroup.Add(1)
+		go func(index int, input domain.Incoming) {
+			defer waitGroup.Done()
+			<-start
+			results[index], errorsFound[index] = store.Begin(ctx, input, app.ConversationLeaseDuration)
+		}(index, input)
+	}
+	close(start)
+	waitGroup.Wait()
+	for index, result := range results {
+		if errorsFound[index] != nil || result.Status != app.BeginClaimed {
+			t.Fatalf("independent SQLite conversation %d = (%v, %v), want claimed", inputs[index].Key.ChatID, result.Status, errorsFound[index])
+		}
+	}
+	for _, result := range results {
+		if err := store.Release(ctx, result.Claim); err != nil {
+			t.Fatalf("release independent SQLite conversation: %v", err)
+		}
+	}
+}
+
+func testSQLiteContextLimitAndIsolation(t *testing.T, ctx context.Context, store *Store) {
+	t.Helper()
+	for turn := range 11 {
+		turnNumber := strconv.Itoa(turn)
+		incoming := sampleIncoming(400+int64(turn), 5, domain.MessageText, "user-"+turnNumber)
+		commitTurn(t, ctx, store, incoming, "assistant-"+turnNumber)
+	}
+	latest := sampleIncoming(411, 5, domain.MessageText, "next")
+	claim := beginClaimed(t, ctx, store, latest)
+	history, err := store.History(ctx, claim)
+	if err != nil || len(history) != app.MaxStoredConversationMessages || history[0].Text != "user-1" || history[len(history)-1].Text != "assistant-10" {
+		t.Fatalf("SQLite trimmed history = (%#v, %v), want newest ten complete pairs", history, err)
+	}
+	if err := store.Release(ctx, claim); err != nil {
+		t.Fatalf("release context-limit claim: %v", err)
+	}
+	other := sampleIncoming(412, 6, domain.MessageText, "other chat")
+	otherClaim := beginClaimed(t, ctx, store, other)
+	otherHistory, err := store.History(ctx, otherClaim)
+	if err != nil || len(otherHistory) != 0 {
+		t.Fatalf("SQLite other-chat history = (%#v, %v), want empty", otherHistory, err)
+	}
+	if err := store.Release(ctx, otherClaim); err != nil {
+		t.Fatalf("release other-chat claim: %v", err)
+	}
+}
+
+func commitTurn(t *testing.T, ctx context.Context, store *Store, incoming domain.Incoming, response string) {
+	t.Helper()
+	claim := beginClaimed(t, ctx, store, incoming)
+	if err := store.CommitResponse(ctx, claim, response); err != nil {
+		t.Fatalf("commit SQLite turn %d: %v", incoming.UpdateID, err)
+	}
+	delivery, err := store.ClaimDelivery(ctx, incoming.UpdateID, app.DeliveryLeaseDuration)
+	if err != nil || delivery.Status != app.DeliveryClaimed {
+		t.Fatalf("claim SQLite turn %d delivery = (%v, %v), want claimed", incoming.UpdateID, delivery.Status, err)
+	}
+	if err := store.MarkSent(ctx, delivery.Delivery, incoming.MessageID+1000); err != nil {
+		t.Fatalf("mark SQLite turn %d sent: %v", incoming.UpdateID, err)
+	}
+}
+
+func beginClaimed(t *testing.T, ctx context.Context, store *Store, incoming domain.Incoming) app.Claim {
+	t.Helper()
+	result, err := store.Begin(ctx, incoming, app.ConversationLeaseDuration)
+	if err != nil || result.Status != app.BeginClaimed {
+		t.Fatalf("begin SQLite update %d = (%v, %v), want claimed", incoming.UpdateID, result.Status, err)
+	}
+	return result.Claim
+}
+
+func sampleIncoming(updateID int64, chatID int64, kind domain.MessageKind, text string) domain.Incoming {
+	return domain.Incoming{
+		UpdateID:  updateID,
+		Key:       domain.ConversationKey{ChatID: chatID},
+		MessageID: updateID + 1,
+		Text:      text,
+		Kind:      kind,
+	}
+}
