@@ -84,6 +84,8 @@ func TestServeHTTPIgnoresUnsupportedAndUnaddressedUpdates(t *testing.T) {
 		{name: "edited message", body: `{"update_id":1,"edited_message":{"message_id":1}}`},
 		{name: "channel post", body: `{"update_id":2,"channel_post":{"message_id":1}}`},
 		{name: "unaddressed group", body: messageJSON(3, "group", "hello", "", false, false)},
+		{name: "lookalike bot mention", body: messageJSON(6, "group", "@yanineko_cat_bot_backup привет", "", false, false)},
+		{name: "bot mention inside email", body: messageJSON(7, "group", "mail@yanineko_cat_bot", "", false, false)},
 		{name: "bot message", body: messageJSON(4, "private", "hello", "", true, false)},
 		{name: "non-text update", body: `{"update_id":5,"message":{"message_id":1,"chat":{"id":1,"type":"private"},"from":{"id":2,"is_bot":false},"photo":[{}]}}`},
 	}
@@ -93,6 +95,9 @@ func TestServeHTTPIgnoresUnsupportedAndUnaddressedUpdates(t *testing.T) {
 			calls := 0
 			handler := Handler{
 				Config: testConfig(),
+				BotUsername: func(context.Context) (string, error) {
+					return "yanineko_cat_bot", nil
+				},
 				Process: func(context.Context, domain.Incoming) error {
 					calls++
 					return nil
@@ -121,6 +126,7 @@ func TestServeHTTPDispatchesPrivateTextAndGroupMentionOrReply(t *testing.T) {
 	}{
 		{name: "private text", body: messageJSON(10, "private", "hello", "", false, false)},
 		{name: "group mention", body: `{"update_id":11,"message":{"message_id":10,"chat":{"id":-42,"type":"supergroup"},"from":{"id":7,"is_bot":false},"text":"😀 Привет @yanineko","entities":[{"type":"mention","offset":10,"length":9}]}}`, username: "yanineko", wantProfile: true},
+		{name: "group mention without entities", body: messageJSON(13, "group", "@yanineko_cat_bot привет", "", false, false), username: "yanineko_cat_bot", wantProfile: true},
 		{name: "reply to bot", body: messageJSON(12, "group", "reply text", "bot", false, true)},
 	}
 	for _, test := range tests {

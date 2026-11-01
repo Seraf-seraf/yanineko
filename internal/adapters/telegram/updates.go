@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Seraf-seraf/yanineko/internal/domain"
 )
@@ -105,7 +107,8 @@ func NeedsBotUsername(update Update) bool {
 	if hasCommand && commandTarget != "" {
 		return true
 	}
-	return (message.Chat.Type == "group" || message.Chat.Type == "supergroup") && hasMentionEntity(message)
+	return (message.Chat.Type == "group" || message.Chat.Type == "supergroup") &&
+		(hasMentionEntity(message) || strings.ContainsRune(message.Text, '@'))
 }
 
 func Classify(update Update, botID int64, botUsername string) (domain.Incoming, bool) {
@@ -195,7 +198,49 @@ func hasMention(message *Message, botUsername string) bool {
 			return true
 		}
 	}
+	return hasTextMention(message.Text, botUsername)
+}
+
+func hasTextMention(text, botUsername string) bool {
+	if botUsername == "" {
+		return false
+	}
+
+	mentionLength := len(botUsername) + 1
+	for offset := 0; offset < len(text); {
+		at := strings.IndexByte(text[offset:], '@')
+		if at < 0 {
+			return false
+		}
+		start := offset + at
+		end := start + mentionLength
+		if end <= len(text) && strings.EqualFold(text[start+1:end], botUsername) &&
+			mentionBoundaryBefore(text, start) && mentionBoundaryAfter(text, end) {
+			return true
+		}
+		offset = start + 1
+	}
 	return false
+}
+
+func mentionBoundaryBefore(text string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	previous, _ := utf8.DecodeLastRuneInString(text[:index])
+	return !isMentionWordRune(previous)
+}
+
+func mentionBoundaryAfter(text string, index int) bool {
+	if index == len(text) {
+		return true
+	}
+	next, _ := utf8.DecodeRuneInString(text[index:])
+	return !isMentionWordRune(next)
+}
+
+func isMentionWordRune(value rune) bool {
+	return value == '@' || value == '_' || unicode.IsLetter(value) || unicode.IsDigit(value)
 }
 
 func isReplyToBot(message *Message, botID int64) bool {
