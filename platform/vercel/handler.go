@@ -33,7 +33,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	responder := openaiadapter.New(cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAIBaseURL)
+	responder := openaiadapter.New(cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAIReasoningEffort, cfg.OpenAIBaseURL)
 	handler := webhook.Handler{
 		Config:      cfg,
 		BotUsername: telegramClient.GetMe,

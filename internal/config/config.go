@@ -14,6 +14,7 @@ type Config struct {
 	TelegramWebhookSecret string
 	OpenAIAPIKey          string
 	OpenAIModel           string
+	OpenAIReasoningEffort string
 	SystemPrompt          string
 	OpenAIBaseURL         string
 	TursoDatabaseURL      string
@@ -21,7 +22,7 @@ type Config struct {
 	DatabaseURL           string
 }
 
-const MaxSystemPromptBytes = 48 * 1024
+const MaxSystemPromptBytes = 64 * 1024
 
 func Load(getenv func(string) string) (Config, error) {
 	if getenv == nil {
@@ -33,6 +34,7 @@ func Load(getenv func(string) string) (Config, error) {
 		TelegramWebhookSecret: getenv("TELEGRAM_WEBHOOK_SECRET"),
 		OpenAIAPIKey:          getenv("OPENAI_API_KEY"),
 		OpenAIModel:           getenv("OPENAI_MODEL"),
+		OpenAIReasoningEffort: getenv("OPENAI_REASONING_EFFORT"),
 		SystemPrompt:          getenv("SYSTEM_PROMPT"),
 		OpenAIBaseURL:         getenv("OPENAI_BASE_URL"),
 		TursoDatabaseURL:      getenv("TURSO_DATABASE_URL"),
@@ -55,6 +57,12 @@ func Load(getenv func(string) string) (Config, error) {
 	if !validSingleLineValue(config.OpenAIModel) {
 		return Config{}, errors.New("invalid OPENAI_MODEL")
 	}
+	if config.OpenAIReasoningEffort == "" {
+		config.OpenAIReasoningEffort = "low"
+	}
+	if !validReasoningEffort(config.OpenAIReasoningEffort) {
+		return Config{}, errors.New("invalid OPENAI_REASONING_EFFORT")
+	}
 	if strings.TrimSpace(config.SystemPrompt) == "" || strings.ContainsRune(config.SystemPrompt, '\x00') || len(config.SystemPrompt) > MaxSystemPromptBytes {
 		return Config{}, errors.New("invalid SYSTEM_PROMPT")
 	}
@@ -72,6 +80,15 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	return config, nil
+}
+
+func validReasoningEffort(value string) bool {
+	switch value {
+	case "none", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
 }
 
 func validTursoURL(value string) bool {

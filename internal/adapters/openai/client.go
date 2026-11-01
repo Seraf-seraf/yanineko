@@ -17,7 +17,7 @@ import (
 )
 
 const RequestTimeout = 30 * time.Second
-const MaxRequestContentBytes = 96 * 1024
+const MaxRequestContentBytes = 112 * 1024
 const MaxOutputTokens int64 = 1024
 
 var ErrInvalidRequest = errors.New("invalid OpenAI request")
@@ -26,12 +26,15 @@ var ErrIncompleteResponse = errors.New("OpenAI response was incomplete")
 var ErrEmptyResponse = errors.New("OpenAI response contained no text")
 
 type Client struct {
-	sdk   openai.Client
-	model string
+	sdk             openai.Client
+	model           string
+	reasoningEffort shared.ReasoningEffort
 }
 
-func New(apiKey, model, baseURL string) *Client {
-	return newClient(apiKey, model, baseURL, nil)
+func New(apiKey, model, reasoningEffort, baseURL string) *Client {
+	client := newClient(apiKey, model, baseURL, nil)
+	client.reasoningEffort = shared.ReasoningEffort(reasoningEffort)
+	return client
 }
 
 func newClient(apiKey, model, baseURL string, httpClient *http.Client) *Client {
@@ -46,7 +49,7 @@ func newClient(apiKey, model, baseURL string, httpClient *http.Client) *Client {
 	if httpClient != nil {
 		options = append(options, option.WithHTTPClient(httpClient))
 	}
-	return &Client{sdk: openai.NewClient(options...), model: model}
+	return &Client{sdk: openai.NewClient(options...), model: model, reasoningEffort: shared.ReasoningEffortLow}
 }
 
 func (c *Client) Respond(ctx context.Context, instructions string, history []domain.Message) (string, error) {
@@ -74,6 +77,7 @@ func (c *Client) Respond(ctx context.Context, instructions string, history []dom
 		Input:           responses.ResponseNewParamsInputUnion{OfInputItemList: input},
 		MaxOutputTokens: param.NewOpt(MaxOutputTokens),
 		Model:           shared.ResponsesModel(c.model),
+		Reasoning:       shared.ReasoningParam{Effort: c.reasoningEffort},
 		Store:           param.NewOpt(false),
 	})
 	if err != nil {

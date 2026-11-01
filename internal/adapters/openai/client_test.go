@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Seraf-seraf/yanineko/internal/domain"
+	"github.com/openai/openai-go/v3/shared"
 )
 
 func TestRespondUsesResponsesAPIInstructionsHistoryAndNoServerStorage(t *testing.T) {
@@ -32,6 +33,9 @@ func TestRespondUsesResponsesAPIInstructionsHistoryAndNoServerStorage(t *testing
 			} `json:"input"`
 			MaxOutputTokens int64 `json:"max_output_tokens"`
 			Store           bool  `json:"store"`
+			Reasoning       struct {
+				Effort string `json:"effort"`
+			} `json:"reasoning"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -63,6 +67,9 @@ func TestRespondUsesResponsesAPIInstructionsHistoryAndNoServerStorage(t *testing
 		if request.Store {
 			t.Error("store = true, want false")
 		}
+		if request.Reasoning.Effort != "low" {
+			t.Errorf("reasoning.effort = %q, want low", request.Reasoning.Effort)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp_1","created_at":1,"model":"gpt-5.1-mini","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"  Продолжение беседы.  "}]}]}`))
 	}))
@@ -78,6 +85,35 @@ func TestRespondUsesResponsesAPIInstructionsHistoryAndNoServerStorage(t *testing
 	}
 	if got != "Продолжение беседы." {
 		t.Fatalf("Respond() = %q, want trimmed output", got)
+	}
+}
+
+func TestRespondUsesConfiguredReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Reasoning struct {
+				Effort string `json:"effort"`
+			} `json:"reasoning"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if request.Reasoning.Effort != "medium" {
+			t.Errorf("reasoning.effort = %q, want medium", request.Reasoning.Effort)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","created_at":1,"model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ответ"}]}]}`))
+	}))
+	defer server.Close()
+
+	client := newClient("synthetic-openai-key", "model", server.URL, server.Client())
+	client.reasoningEffort = shared.ReasoningEffortMedium
+	if _, err := client.Respond(context.Background(), "инструкции", []domain.Message{{Role: domain.RoleUser, Text: "привет"}}); err != nil {
+		t.Fatalf("Respond() error = %v", err)
 	}
 }
 

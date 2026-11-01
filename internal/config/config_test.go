@@ -24,6 +24,9 @@ func TestLoadAcceptsValidConfigurationAndPreservesMultilinePrompt(t *testing.T) 
 	if config.OpenAIBaseURL != values["OPENAI_BASE_URL"] {
 		t.Fatalf("OpenAIBaseURL = %q, want %q", config.OpenAIBaseURL, values["OPENAI_BASE_URL"])
 	}
+	if config.OpenAIReasoningEffort != values["OPENAI_REASONING_EFFORT"] {
+		t.Fatalf("OpenAIReasoningEffort = %q, want %q", config.OpenAIReasoningEffort, values["OPENAI_REASONING_EFFORT"])
+	}
 }
 
 func TestLoadAcceptsOptionalBaseURLWhenUnset(t *testing.T) {
@@ -36,6 +39,20 @@ func TestLoadAcceptsOptionalBaseURLWhenUnset(t *testing.T) {
 	}
 	if config.OpenAIBaseURL != "" {
 		t.Fatalf("OpenAIBaseURL = %q, want empty", config.OpenAIBaseURL)
+	}
+}
+
+func TestLoadDefaultsReasoningEffortToLow(t *testing.T) {
+	t.Parallel()
+
+	values := validValues()
+	delete(values, "OPENAI_REASONING_EFFORT")
+	config, err := Load(lookup(values))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.OpenAIReasoningEffort != "low" {
+		t.Fatalf("OpenAIReasoningEffort = %q, want low", config.OpenAIReasoningEffort)
 	}
 }
 
@@ -53,6 +70,7 @@ func TestLoadRejectsMissingAndMalformedValues(t *testing.T) {
 		{name: "invalid webhook secret", key: "TELEGRAM_WEBHOOK_SECRET", value: "contains spaces"},
 		{name: "missing API key", key: "OPENAI_API_KEY", value: ""},
 		{name: "multiline model", key: "OPENAI_MODEL", value: "model\nother"},
+		{name: "invalid reasoning effort", key: "OPENAI_REASONING_EFFORT", value: "extreme"},
 		{name: "blank prompt", key: "SYSTEM_PROMPT", value: " \n "},
 		{name: "insecure base URL", key: "OPENAI_BASE_URL", value: "http://api.openai.com/v1"},
 		{name: "invalid Turso URL", key: "TURSO_DATABASE_URL", value: "https://"},
@@ -91,6 +109,7 @@ func validValues() map[string]string {
 		"TELEGRAM_WEBHOOK_SECRET": "synthetic_secret-123",
 		"OPENAI_API_KEY":          "synthetic-openai-key",
 		"OPENAI_MODEL":            "gpt-5.1-mini",
+		"OPENAI_REASONING_EFFORT": "low",
 		"SYSTEM_PROMPT":           "Действуй как персонаж.",
 		"TURSO_DATABASE_URL":      "libsql://yanineko-test.turso.io",
 		"TURSO_AUTH_TOKEN":        "synthetic-turso-token",

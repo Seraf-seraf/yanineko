@@ -31,6 +31,7 @@ Runtime использует прямой Turso HTTP-драйвер и пере�
 | `TELEGRAM_WEBHOOK_SECRET` | Секрет для заголовка `X-Telegram-Bot-Api-Secret-Token`; допустимы `A-Z`, `a-z`, `0-9`, `_`, `-`, длина 1–256. |
 | `OPENAI_API_KEY` | OpenAI API key, не токен подписки ChatGPT. |
 | `OPENAI_MODEL` | Имя модели для Responses API. |
+| `OPENAI_REASONING_EFFORT` | Усилие reasoning: `none`, `low`, `medium`, `high`, `xhigh` или `max`; по умолчанию `low`. |
 | `SYSTEM_PROMPT` | Инструкции персонажа; многострочное значение поддерживается. |
 | `OPENAI_BASE_URL` | Необязательно; только проверенный endpoint, совместимый с Responses API. |
 | `TURSO_DATABASE_URL` | URL удалённой Turso базы, выданный интеграцией. |
