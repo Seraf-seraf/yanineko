@@ -77,7 +77,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.Process(ctx, incoming); err != nil {
-		slog.ErrorContext(ctx, "update processing failed", "update_id", update.ID, "phase", "process", "code", "processing_failed")
+		slog.ErrorContext(ctx, "update processing failed", "update_id", update.ID, "phase", "process", "code", "processing_failed", "failure", err.Error())
 		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
