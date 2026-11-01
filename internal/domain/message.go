@@ -30,8 +30,10 @@ const (
 )
 
 type Message struct {
-	Role Role
-	Text string
+	UpdateID     int64
+	ArchiveOrder int64
+	Role         Role
+	Text         string
 }
 
 type Outgoing struct {

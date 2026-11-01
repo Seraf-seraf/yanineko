@@ -40,15 +40,31 @@ func TestSQLiteStoreWithRealDriver(t *testing.T) {
 
 	first := sampleIncoming(100, 1, domain.MessageText, "first")
 	claim := beginClaimed(t, ctx, store, first)
-	if history, err := store.History(ctx, claim); err != nil || len(history) != 0 {
-		t.Fatalf("initial history = (%#v, %v), want empty", history, err)
+	if history, err := store.History(ctx, claim, -1); err != nil || len(history) != 1 || history[0].Text != first.Text || history[0].Role != domain.RoleUser {
+		t.Fatalf("initial archive = (%#v, %v), want input archived before generation", history, err)
 	}
 	duplicate, err := store.Begin(ctx, first, app.ConversationLeaseDuration)
 	if err != nil || duplicate.Status != app.BeginBusy {
 		t.Fatalf("duplicate while processing = (%v, %v), want busy", duplicate.Status, err)
 	}
-	if err := store.CommitResponse(ctx, claim, "first reply"); err != nil {
+	if err := store.Release(ctx, claim); err != nil {
+		t.Fatalf("release failed-generation claim: %v", err)
+	}
+	retry, err := store.Begin(ctx, first, app.ConversationLeaseDuration)
+	if err != nil || retry.Status != app.BeginClaimed {
+		t.Fatalf("retry failed-generation input = (%v, %v), want reclaimed", retry.Status, err)
+	}
+	claim = retry.Claim
+	if history, err := store.History(ctx, claim, -1); err != nil || len(history) != 1 || history[0].Text != first.Text {
+		t.Fatalf("archive after failed-generation retry = (%#v, %v), want one retained user input", history, err)
+	}
+	if err := store.CommitResponse(ctx, claim, "first reply", testModelContext()); err != nil {
 		t.Fatalf("atomically commit response and history: %v", err)
+	}
+	var throughMessageOrder int64
+	var itemsJSON string
+	if err := store.db.QueryRowContext(ctx, `SELECT through_message_order, items_json FROM model_contexts WHERE chat_id = ? AND thread_id = ?`, first.Key.ChatID, first.Key.ThreadID).Scan(&throughMessageOrder, &itemsJSON); err != nil || throughMessageOrder != 2 || itemsJSON != "[]" {
+		t.Fatalf("persisted model context = (%d, %q, %v), want opaque checkpoint and archive watermark", throughMessageOrder, itemsJSON, err)
 	}
 	duplicate, err = store.Begin(ctx, first, app.ConversationLeaseDuration)
 	if err != nil || duplicate.Status != app.BeginReady {
@@ -73,9 +89,17 @@ func TestSQLiteStoreWithRealDriver(t *testing.T) {
 
 	second := sampleIncoming(101, 1, domain.MessageText, "restored")
 	secondClaim := beginClaimed(t, ctx, store, second)
-	history, err := store.History(ctx, secondClaim)
-	if err != nil || len(history) != 2 || history[0].Text != first.Text || history[1].Text != "first reply" {
-		t.Fatalf("restored history = (%#v, %v), want persisted user/assistant pair", history, err)
+	modelContext, err := store.ModelContext(ctx, secondClaim)
+	if err != nil {
+		t.Fatalf("load model context: %v", err)
+	}
+	history, err := store.History(ctx, secondClaim, modelContext.ThroughMessageOrder)
+	if err != nil || len(history) != 1 || history[0].Text != second.Text || history[0].Role != domain.RoleUser {
+		t.Fatalf("incremental history = (%#v, %v), want only the newly archived input", history, err)
+	}
+	archive, err := store.History(ctx, secondClaim, -1)
+	if err != nil || len(archive) != 3 || archive[0].Text != first.Text || archive[1].Text != "first reply" || archive[2].Text != second.Text {
+		t.Fatalf("full archive = (%#v, %v), want all messages without trimming", archive, err)
 	}
 	if err := store.Release(ctx, secondClaim); err != nil {
 		t.Fatalf("release pre-generation claim: %v", err)
@@ -115,7 +139,7 @@ func TestSQLiteStoreWithRealDriver(t *testing.T) {
 	if newClaim.Version <= oldClaim.Version || newClaim.OwnerToken == oldClaim.OwnerToken {
 		t.Fatalf("reclaimed fencing token = (%d, %q), old = (%d, %q)", newClaim.Version, newClaim.OwnerToken, oldClaim.Version, oldClaim.OwnerToken)
 	}
-	if err := store.CommitResponse(ctx, oldClaim, "stale response"); !errors.Is(err, ErrLeaseLost) {
+	if err := store.CommitResponse(ctx, oldClaim, "stale response", testModelContext()); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale response commit error = %v, want ErrLeaseLost", err)
 	}
 	if err := store.Release(ctx, newClaim); err != nil {
@@ -171,7 +195,7 @@ func TestSQLiteStoreWithRealDriver(t *testing.T) {
 
 	testConcurrentSQLiteUpdates(t, ctx, store)
 	testConcurrentSQLiteConversations(t, ctx, store)
-	testSQLiteContextLimitAndIsolation(t, ctx, store)
+	testSQLiteHistoryRetentionAndIsolation(t, ctx, store)
 
 	var aboutHistoryCount int64
 	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM conversation_messages WHERE chat_id = ? AND thread_id = ? AND update_id = ?`, about.Key.ChatID, about.Key.ThreadID, about.UpdateID).Scan(&aboutHistoryCount); err != nil {
@@ -262,7 +286,7 @@ func testConcurrentSQLiteConversations(t *testing.T, ctx context.Context, store 
 	}
 }
 
-func testSQLiteContextLimitAndIsolation(t *testing.T, ctx context.Context, store *Store) {
+func testSQLiteHistoryRetentionAndIsolation(t *testing.T, ctx context.Context, store *Store) {
 	t.Helper()
 	for turn := range 11 {
 		turnNumber := strconv.Itoa(turn)
@@ -271,18 +295,18 @@ func testSQLiteContextLimitAndIsolation(t *testing.T, ctx context.Context, store
 	}
 	latest := sampleIncoming(411, 5, domain.MessageText, "next")
 	claim := beginClaimed(t, ctx, store, latest)
-	history, err := store.History(ctx, claim)
-	if err != nil || len(history) != app.MaxStoredConversationMessages || history[0].Text != "user-1" || history[len(history)-1].Text != "assistant-10" {
-		t.Fatalf("SQLite trimmed history = (%#v, %v), want newest ten complete pairs", history, err)
+	history, err := store.History(ctx, claim, -1)
+	if err != nil || len(history) != 23 || history[0].Text != "user-0" || history[len(history)-1].Text != "next" {
+		t.Fatalf("SQLite archive = (%#v, %v), want all eleven replies plus current input", history, err)
 	}
 	if err := store.Release(ctx, claim); err != nil {
 		t.Fatalf("release context-limit claim: %v", err)
 	}
 	other := sampleIncoming(412, 6, domain.MessageText, "other chat")
 	otherClaim := beginClaimed(t, ctx, store, other)
-	otherHistory, err := store.History(ctx, otherClaim)
-	if err != nil || len(otherHistory) != 0 {
-		t.Fatalf("SQLite other-chat history = (%#v, %v), want empty", otherHistory, err)
+	otherHistory, err := store.History(ctx, otherClaim, -1)
+	if err != nil || len(otherHistory) != 1 || otherHistory[0].Text != "other chat" {
+		t.Fatalf("SQLite other-chat archive = (%#v, %v), want only its own input", otherHistory, err)
 	}
 	if err := store.Release(ctx, otherClaim); err != nil {
 		t.Fatalf("release other-chat claim: %v", err)
@@ -292,7 +316,7 @@ func testSQLiteContextLimitAndIsolation(t *testing.T, ctx context.Context, store
 func commitTurn(t *testing.T, ctx context.Context, store *Store, incoming domain.Incoming, response string) {
 	t.Helper()
 	claim := beginClaimed(t, ctx, store, incoming)
-	if err := store.CommitResponse(ctx, claim, response); err != nil {
+	if err := store.CommitResponse(ctx, claim, response, testModelContext()); err != nil {
 		t.Fatalf("commit SQLite turn %d: %v", incoming.UpdateID, err)
 	}
 	delivery, err := store.ClaimDelivery(ctx, incoming.UpdateID, app.DeliveryLeaseDuration)
@@ -302,6 +326,10 @@ func commitTurn(t *testing.T, ctx context.Context, store *Store, incoming domain
 	if err := store.MarkSent(ctx, delivery.Delivery, incoming.MessageID+1000); err != nil {
 		t.Fatalf("mark SQLite turn %d sent: %v", incoming.UpdateID, err)
 	}
+}
+
+func testModelContext() domain.ModelContext {
+	return domain.ModelContext{ItemsJSON: []byte("[]"), Initialized: true}
 }
 
 func beginClaimed(t *testing.T, ctx context.Context, store *Store, incoming domain.Incoming) app.Claim {

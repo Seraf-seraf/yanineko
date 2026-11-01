@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -45,7 +46,10 @@ func TestHandleTextPassesPromptAndHistoryAndPersistsResponse(t *testing.T) {
 
 	input := sampleIncoming(domain.MessageText, "Привет, @yanineko")
 	store := newTestStore(input)
-	store.history = []domain.Message{{Role: domain.RoleUser, Text: "Как дела?"}, {Role: domain.RoleAssistant, Text: "Хорошо."}}
+	store.history = []domain.Message{
+		{UpdateID: 40, ArchiveOrder: 1, Role: domain.RoleUser, Text: "Как дела?"},
+		{UpdateID: 40, ArchiveOrder: 2, Role: domain.RoleAssistant, Text: "Хорошо."},
+	}
 	responder := &testResponder{response: "  Привет!  "}
 	messenger := &testMessenger{}
 	service := Service{SystemPrompt: "Точный\nмногострочный промпт", Store: store, Responder: responder, Messenger: messenger}
@@ -53,19 +57,22 @@ func TestHandleTextPassesPromptAndHistoryAndPersistsResponse(t *testing.T) {
 	if err := service.Handle(context.Background(), input); err != nil {
 		t.Fatalf("Handle() error = %v", err)
 	}
-	if responder.prompt != service.SystemPrompt {
-		t.Fatalf("prompt = %q, want exact configured prompt", responder.prompt)
+	if responder.request.Instructions != service.SystemPrompt {
+		t.Fatalf("prompt = %q, want exact configured prompt", responder.request.Instructions)
 	}
 	wantHistory := []domain.Message{
-		{Role: domain.RoleUser, Text: "Как дела?"},
-		{Role: domain.RoleAssistant, Text: "Хорошо."},
-		{Role: domain.RoleUser, Text: input.Text},
+		{UpdateID: 40, ArchiveOrder: 1, Role: domain.RoleUser, Text: "Как дела?"},
+		{UpdateID: 40, ArchiveOrder: 2, Role: domain.RoleAssistant, Text: "Хорошо."},
+		{UpdateID: input.UpdateID, ArchiveOrder: 3, Role: domain.RoleUser, Text: input.Text},
 	}
-	if !equalMessages(responder.history, wantHistory) {
-		t.Fatalf("history = %#v, want %#v", responder.history, wantHistory)
+	if !equalMessages(responder.request.Messages, wantHistory) {
+		t.Fatalf("history = %#v, want %#v", responder.request.Messages, wantHistory)
 	}
 	if store.response != "Привет!" {
 		t.Fatalf("stored response = %q, want trimmed text", store.response)
+	}
+	if !store.modelContext.Initialized || store.modelContext.ThroughMessageOrder != 4 {
+		t.Fatalf("committed model context = %#v, want initialized checkpoint", store.modelContext)
 	}
 	if len(messenger.sent) != 1 || messenger.sent[0].Text != "Привет!" {
 		t.Fatalf("sent messages = %#v, want one trimmed response", messenger.sent)
@@ -113,6 +120,9 @@ func TestHandleReleasesClaimAfterResponderError(t *testing.T) {
 	if !store.released {
 		t.Fatal("processing claim was not released after generation failure")
 	}
+	if len(store.history) != 1 || store.history[0].Role != domain.RoleUser || store.history[0].Text != input.Text {
+		t.Fatalf("archive after generation failure = %#v, want failed input retained", store.history)
+	}
 	if len(messenger.sent) != 0 {
 		t.Fatalf("sent messages = %#v, want none", messenger.sent)
 	}
@@ -157,33 +167,51 @@ func TestHandleDuplicateSentUpdateIsAcknowledgedWithoutSideEffects(t *testing.T)
 	}
 }
 
-func TestPrepareHistoryTrimsOldestCompletePairs(t *testing.T) {
+func TestHandlePassesEntireUncompactedHistory(t *testing.T) {
 	t.Parallel()
 
-	previous := make([]domain.Message, 0, 22)
-	for index := range 11 {
+	input := sampleIncoming(domain.MessageText, "current")
+	store := newTestStore(input)
+	previous := make([]domain.Message, 0, 60)
+	for index := range 30 {
 		previous = append(previous,
-			domain.Message{Role: domain.RoleUser, Text: "u" + strings.Repeat("x", 1) + string(rune('a'+index))},
-			domain.Message{Role: domain.RoleAssistant, Text: "a" + string(rune('a'+index))})
+			domain.Message{UpdateID: int64(index + 1), ArchiveOrder: int64(index*2 + 1), Role: domain.RoleUser, Text: "u" + string(rune('a'+index))},
+			domain.Message{UpdateID: int64(index + 1), ArchiveOrder: int64(index*2 + 2), Role: domain.RoleAssistant, Text: "a" + string(rune('a'+index))})
 	}
-	history, err := prepareHistory(previous, domain.Message{Role: domain.RoleUser, Text: "current"})
-	if err != nil {
-		t.Fatalf("prepareHistory() error = %v", err)
+	store.history = previous
+	responder := &testResponder{response: "reply"}
+	service := Service{Store: store, Responder: responder, Messenger: &testMessenger{}}
+	if err := service.Handle(context.Background(), input); err != nil {
+		t.Fatalf("Handle() error = %v", err)
 	}
-	if len(history) != MaxContextMessages {
-		t.Fatalf("history length = %d, want %d", len(history), MaxContextMessages)
+	if got, want := len(responder.request.Messages), len(previous)+1; got != want {
+		t.Fatalf("history length = %d, want all %d messages", got, want)
 	}
-	if history[0].Text != previous[2].Text || history[len(history)-1].Text != "current" {
-		t.Fatalf("trimmed history boundaries = %#v, want oldest pair removed", history)
+	if responder.request.Messages[0].Text != previous[0].Text || responder.request.Messages[len(responder.request.Messages)-1].Text != input.Text {
+		t.Fatalf("history boundaries = %#v, want oldest archived message through current input", responder.request.Messages)
 	}
 }
 
-func TestPrepareHistoryRejectsOversizedCurrentInput(t *testing.T) {
+func TestHandlePassesOnlyMessagesAfterModelCheckpoint(t *testing.T) {
 	t.Parallel()
 
-	_, err := prepareHistory(nil, domain.Message{Role: domain.RoleUser, Text: strings.Repeat("x", MaxConversationTextBytes+1)})
-	if !errors.Is(err, ErrInputTooLarge) {
-		t.Fatalf("prepareHistory() error = %v, want ErrInputTooLarge", err)
+	input := sampleIncoming(domain.MessageText, "new message")
+	store := newTestStore(input)
+	store.modelContext = domain.ModelContext{ThroughMessageOrder: 90, Initialized: true, ItemsJSON: json.RawMessage(`[{"type":"message","role":"assistant"}]`)}
+	store.history = []domain.Message{
+		{UpdateID: 80, ArchiveOrder: 80, Role: domain.RoleUser, Text: "already in context"},
+		{UpdateID: 80, ArchiveOrder: 90, Role: domain.RoleAssistant, Text: "already answered"},
+	}
+	responder := &testResponder{response: "reply"}
+	service := Service{Store: store, Responder: responder, Messenger: &testMessenger{}}
+	if err := service.Handle(context.Background(), input); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(responder.request.Messages) != 1 || responder.request.Messages[0].Text != input.Text {
+		t.Fatalf("incremental messages = %#v, want only current message", responder.request.Messages)
+	}
+	if responder.request.Context.ThroughMessageOrder != 90 {
+		t.Fatalf("context watermark = %d, want 90", responder.request.Context.ThroughMessageOrder)
 	}
 }
 
@@ -212,7 +240,9 @@ func equalMessages(left, right []domain.Message) bool {
 type testStore struct {
 	begin         BeginResult
 	history       []domain.Message
+	modelContext  domain.ModelContext
 	response      string
+	committed     domain.ModelContext
 	aboutResponse string
 	released      bool
 	unknownMarked bool
@@ -226,6 +256,10 @@ func newTestStore(incoming domain.Incoming) *testStore {
 	return &testStore{
 		begin: BeginResult{Status: BeginClaimed, Claim: claim},
 		claim: claim,
+		modelContext: domain.ModelContext{
+			ThroughMessageOrder: 0,
+			ItemsJSON:           json.RawMessage("[]"),
+		},
 		delivery: Delivery{
 			UpdateID: incoming.UpdateID, OwnerToken: strings.Repeat("b", 32),
 			ProcessingOwner: claim.OwnerToken,
@@ -234,20 +268,56 @@ func newTestStore(incoming domain.Incoming) *testStore {
 	}
 }
 
-func (s *testStore) Begin(_ context.Context, _ domain.Incoming, duration time.Duration) (BeginResult, error) {
+func (s *testStore) Begin(_ context.Context, incoming domain.Incoming, duration time.Duration) (BeginResult, error) {
 	if duration != ConversationLeaseDuration {
 		return BeginResult{}, errors.New("unexpected conversation lease")
+	}
+	if s.begin.Status == BeginClaimed && incoming.Kind == domain.MessageText {
+		found := false
+		for _, message := range s.history {
+			if message.UpdateID == incoming.UpdateID && message.Role == domain.RoleUser {
+				found = true
+				break
+			}
+		}
+		if !found {
+			archiveOrder := int64(1)
+			for _, message := range s.history {
+				if message.ArchiveOrder >= archiveOrder {
+					archiveOrder = message.ArchiveOrder + 1
+				}
+			}
+			s.history = append(s.history, domain.Message{UpdateID: incoming.UpdateID, ArchiveOrder: archiveOrder, Role: domain.RoleUser, Text: incoming.Text})
+		}
 	}
 	return s.begin, nil
 }
 
-func (s *testStore) History(_ context.Context, claim Claim) ([]domain.Message, error) {
+func (s *testStore) History(_ context.Context, claim Claim, afterMessageOrder int64) ([]domain.Message, error) {
 	s.claim = claim
-	return append([]domain.Message(nil), s.history...), nil
+	var history []domain.Message
+	for _, message := range s.history {
+		if message.ArchiveOrder > afterMessageOrder {
+			history = append(history, message)
+		}
+	}
+	return history, nil
 }
 
-func (s *testStore) CommitResponse(_ context.Context, claim Claim, response string) error {
-	s.claim, s.response = claim, response
+func (s *testStore) ModelContext(_ context.Context, claim Claim) (domain.ModelContext, error) {
+	s.claim = claim
+	return s.modelContext, nil
+}
+
+func (s *testStore) CommitResponse(_ context.Context, claim Claim, response string, modelContext domain.ModelContext) error {
+	var maxOrder int64
+	for _, message := range s.history {
+		if message.ArchiveOrder > maxOrder {
+			maxOrder = message.ArchiveOrder
+		}
+	}
+	modelContext.ThroughMessageOrder = maxOrder + 1
+	s.claim, s.response, s.modelContext, s.committed = claim, response, modelContext, modelContext
 	s.delivery.Outgoing.Text = response
 	return nil
 }
@@ -291,17 +361,18 @@ func (s *testStore) Release(_ context.Context, claim Claim) error {
 
 type testResponder struct {
 	calls    int
-	prompt   string
-	history  []domain.Message
+	request  domain.AgentRequest
 	response string
 	err      error
 }
 
-func (r *testResponder) Respond(_ context.Context, prompt string, history []domain.Message) (string, error) {
+func (r *testResponder) Respond(_ context.Context, request domain.AgentRequest, _ domain.AgentMemory) (domain.AgentResult, error) {
 	r.calls++
-	r.prompt = prompt
-	r.history = append([]domain.Message(nil), history...)
-	return r.response, r.err
+	r.request = request
+	if r.err != nil {
+		return domain.AgentResult{}, r.err
+	}
+	return domain.AgentResult{Text: r.response, ItemsJSON: json.RawMessage("[]")}, nil
 }
 
 type testMessenger struct {

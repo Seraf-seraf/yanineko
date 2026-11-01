@@ -23,6 +23,7 @@ type Config struct {
 }
 
 const MaxSystemPromptBytes = 64 * 1024
+const DefaultOpenAIModel = "gpt-6-luna"
 
 func Load(getenv func(string) string) (Config, error) {
 	if getenv == nil {
@@ -40,6 +41,9 @@ func Load(getenv func(string) string) (Config, error) {
 		TursoDatabaseURL:      getenv("TURSO_DATABASE_URL"),
 		TursoAuthToken:        getenv("TURSO_AUTH_TOKEN"),
 		DatabaseURL:           getenv("DATABASE_URL"),
+	}
+	if config.OpenAIModel == "" {
+		config.OpenAIModel = DefaultOpenAIModel
 	}
 
 	botID, err := telegramBotID(config.TelegramBotToken)

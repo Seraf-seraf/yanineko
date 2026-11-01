@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/url"
@@ -34,7 +35,7 @@ var ErrLeaseLost = errors.New("conversation lease lost")
 var ErrUpdateConflict = errors.New("Telegram update id conflict")
 var ErrUpdateNotFound = errors.New("Telegram update not found")
 
-//go:embed migrations/001_initial.sql
+//go:embed migrations/*.sql
 var migrations embed.FS
 
 type Store struct {
@@ -119,20 +120,23 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`); err != nil {
 		return databaseError(ctx, err, ErrSchemaMigration)
 	}
-	var applied bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM yanineko_schema_migrations WHERE version = 1)`).Scan(&applied)
-	if err != nil {
-		return databaseError(ctx, err, ErrSchemaMigration)
-	}
-	if !applied {
-		script, err := migrations.ReadFile("migrations/001_initial.sql")
+	for version, name := range []string{"migrations/001_initial.sql", "migrations/002_model_contexts.sql", "migrations/003_archive_order.sql"} {
+		migrationVersion := version + 1
+		var applied bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM yanineko_schema_migrations WHERE version = $1)`, migrationVersion).Scan(&applied); err != nil {
+			return databaseError(ctx, err, ErrSchemaMigration)
+		}
+		if applied {
+			continue
+		}
+		script, err := migrations.ReadFile(name)
 		if err != nil {
 			return ErrSchemaMigration
 		}
 		if _, err := tx.Conn().PgConn().Exec(ctx, string(script)).ReadAll(); err != nil {
 			return databaseError(ctx, err, ErrSchemaMigration)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO yanineko_schema_migrations (version) VALUES (1)`); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO yanineko_schema_migrations (version) VALUES ($1)`, migrationVersion); err != nil {
 			return databaseError(ctx, err, ErrSchemaMigration)
 		}
 	}
@@ -243,13 +247,18 @@ func (s *Store) Begin(ctx context.Context, incoming domain.Incoming, leaseDurati
 		}
 		return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
 	}
+	if incoming.Kind == domain.MessageText {
+		if err := insertArchivedUserMessage(ctx, tx, incoming.Key, incoming.UpdateID, incoming.Text); err != nil {
+			return app.BeginResult{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
 	}
 	return app.BeginResult{Status: app.BeginClaimed, Claim: claimFromIncoming(incoming, owner, version)}, nil
 }
 
-func (s *Store) History(ctx context.Context, claim app.Claim) ([]domain.Message, error) {
+func (s *Store) History(ctx context.Context, claim app.Claim, afterUpdateID int64) ([]domain.Message, error) {
 	if !validClaim(claim) || claim.Incoming.Kind != domain.MessageText {
 		return nil, ErrLeaseLost
 	}
@@ -270,19 +279,19 @@ func (s *Store) History(ctx context.Context, claim app.Claim) ([]domain.Message,
 		return nil, ErrLeaseLost
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT role, content
+		SELECT update_id, archive_order, role, content
 		FROM conversation_messages
-		WHERE chat_id = $1 AND thread_id = $2
-		ORDER BY update_id, CASE role WHEN 'user' THEN 0 ELSE 1 END`,
-		claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID)
+		WHERE chat_id = $1 AND thread_id = $2 AND archive_order > $3
+		ORDER BY archive_order`,
+		claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID, afterUpdateID)
 	if err != nil {
 		return nil, databaseError(ctx, err, ErrDatabaseOperation)
 	}
 	defer rows.Close()
-	history := make([]domain.Message, 0, app.MaxStoredConversationMessages)
+	history := make([]domain.Message, 0)
 	for rows.Next() {
 		var message domain.Message
-		if err := rows.Scan(&message.Role, &message.Text); err != nil {
+		if err := rows.Scan(&message.UpdateID, &message.ArchiveOrder, &message.Role, &message.Text); err != nil {
 			return nil, databaseError(ctx, err, ErrDatabaseOperation)
 		}
 		history = append(history, message)
@@ -296,22 +305,67 @@ func (s *Store) History(ctx context.Context, claim app.Claim) ([]domain.Message,
 	return history, nil
 }
 
-func (s *Store) CommitResponse(ctx context.Context, claim app.Claim, response string) error {
+func (s *Store) ModelContext(ctx context.Context, claim app.Claim) (domain.ModelContext, error) {
+	if !validClaim(claim) || claim.Incoming.Kind != domain.MessageText {
+		return domain.ModelContext{}, ErrLeaseLost
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.ModelContext{}, databaseError(ctx, err, ErrDatabaseOperation)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	conversation, err := lockConversation(ctx, tx, claim.Incoming.Key)
+	if err != nil {
+		return domain.ModelContext{}, err
+	}
+	update, err := lockUpdate(ctx, tx, claim.Incoming.UpdateID)
+	if err != nil {
+		return domain.ModelContext{}, safeQueryError(ctx, err)
+	}
+	if !claimOwns(conversation, update, claim) {
+		return domain.ModelContext{}, ErrLeaseLost
+	}
+	var modelContext domain.ModelContext
+	err = tx.QueryRow(ctx, `
+		SELECT through_message_order, items_json
+		FROM model_contexts WHERE chat_id = $1 AND thread_id = $2`,
+		claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID).Scan(
+		&modelContext.ThroughMessageOrder, &modelContext.ItemsJSON)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return domain.ModelContext{}, databaseError(ctx, err, ErrDatabaseOperation)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		modelContext.ThroughMessageOrder = 0
+		modelContext.ItemsJSON = json.RawMessage("[]")
+		modelContext.Initialized = false
+	} else {
+		modelContext.Initialized = true
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ModelContext{}, databaseError(ctx, err, ErrDatabaseOperation)
+	}
+	return modelContext, nil
+}
+
+func (s *Store) CommitResponse(ctx context.Context, claim app.Claim, response string, modelContext domain.ModelContext) error {
 	if claim.Incoming.Kind != domain.MessageText {
 		return ErrLeaseLost
 	}
-	return s.commitResponse(ctx, claim, response, true)
+	return s.commitResponse(ctx, claim, response, modelContext)
 }
 
 func (s *Store) CommitAbout(ctx context.Context, claim app.Claim, response string) error {
 	if claim.Incoming.Kind != domain.MessageAbout {
 		return ErrLeaseLost
 	}
-	return s.commitResponse(ctx, claim, response, false)
+	return s.commitResponse(ctx, claim, response, domain.ModelContext{})
 }
 
-func (s *Store) commitResponse(ctx context.Context, claim app.Claim, response string, saveHistory bool) error {
+func (s *Store) commitResponse(ctx context.Context, claim app.Claim, response string, modelContext domain.ModelContext) error {
 	if !validClaim(claim) || strings.TrimSpace(response) == "" || len(response) > app.MaxConversationTextBytes || !utf8.ValidString(response) || strings.ContainsRune(response, '\x00') {
+		return ErrDatabaseConfiguration
+	}
+	if claim.Incoming.Kind == domain.MessageText && (!modelContext.Initialized || len(modelContext.ItemsJSON) == 0 || !json.Valid(modelContext.ItemsJSON) || modelContext.ItemsJSON[0] != '[') {
 		return ErrDatabaseConfiguration
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -330,22 +384,26 @@ func (s *Store) commitResponse(ctx context.Context, claim app.Claim, response st
 	if !claimOwns(conversation, update, claim) {
 		return ErrLeaseLost
 	}
-	if saveHistory {
+	if claim.Incoming.Kind == domain.MessageText {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO conversation_messages (chat_id, thread_id, update_id, role, content)
-			VALUES ($1, $2, $3, 'user', $4), ($1, $2, $3, 'assistant', $5)`,
-			claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID, claim.Incoming.UpdateID,
-			claim.Incoming.Text, response); err != nil {
+			INSERT INTO conversation_messages (chat_id, thread_id, update_id, archive_order, role, content)
+			VALUES ($1, $2, $3, (SELECT COALESCE(MAX(archive_order), 0) + 1 FROM conversation_messages WHERE chat_id = $1 AND thread_id = $2), 'assistant', $4)`,
+			claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID, claim.Incoming.UpdateID, response); err != nil {
+			return databaseError(ctx, err, ErrDatabaseOperation)
+		}
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(archive_order), 0) FROM conversation_messages WHERE chat_id = $1 AND thread_id = $2`,
+			claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID).Scan(&modelContext.ThroughMessageOrder); err != nil {
 			return databaseError(ctx, err, ErrDatabaseOperation)
 		}
 		if _, err := tx.Exec(ctx, `
-			DELETE FROM conversation_messages
-			WHERE chat_id = $1 AND thread_id = $2
-			  AND update_id NOT IN (
-				SELECT update_id FROM conversation_messages
-				WHERE chat_id = $1 AND thread_id = $2
-				GROUP BY update_id ORDER BY update_id DESC LIMIT 10
-			  )`, claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID); err != nil {
+			INSERT INTO model_contexts (chat_id, thread_id, through_message_order, items_json)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (chat_id, thread_id) DO UPDATE SET
+				through_message_order = EXCLUDED.through_message_order,
+				items_json = EXCLUDED.items_json,
+				updated_at = clock_timestamp()`,
+			claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID,
+			modelContext.ThroughMessageOrder, string(modelContext.ItemsJSON)); err != nil {
 			return databaseError(ctx, err, ErrDatabaseOperation)
 		}
 	}
@@ -634,6 +692,11 @@ func (s *Store) beginExisting(ctx context.Context, tx pgx.Tx, conversation conve
 	claim := claimFromRecord(update)
 	switch update.State {
 	case "processing":
+		if update.Kind == "text" {
+			if err := insertArchivedUserMessage(ctx, tx, domain.ConversationKey{ChatID: update.ChatID, ThreadID: update.ThreadID}, update.UpdateID, update.InputText); err != nil {
+				return app.BeginResult{}, err
+			}
+		}
 		if leaseActive(conversation) {
 			return app.BeginResult{Status: app.BeginBusy, Claim: claim}, nil
 		}
@@ -675,6 +738,11 @@ func (s *Store) beginEarlierPending(ctx context.Context, tx pgx.Tx, conversation
 	claim := claimFromRecord(update)
 	switch update.State {
 	case "processing":
+		if update.Kind == "text" {
+			if err := insertArchivedUserMessage(ctx, tx, domain.ConversationKey{ChatID: update.ChatID, ThreadID: update.ThreadID}, update.UpdateID, update.InputText); err != nil {
+				return app.BeginResult{}, false, err
+			}
+		}
 		if leaseActive(*conversation) {
 			return app.BeginResult{Status: app.BeginBusy, Claim: claim}, true, nil
 		}
@@ -716,6 +784,17 @@ func (s *Store) beginEarlierPending(ctx context.Context, tx pgx.Tx, conversation
 	default:
 		return app.BeginResult{}, false, ErrDatabaseOperation
 	}
+}
+
+func insertArchivedUserMessage(ctx context.Context, tx pgx.Tx, key domain.ConversationKey, updateID int64, text string) error {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO conversation_messages (chat_id, thread_id, update_id, archive_order, role, content)
+		VALUES ($1, $2, $3, (SELECT COALESCE(MAX(archive_order), 0) + 1 FROM conversation_messages WHERE chat_id = $1 AND thread_id = $2), 'user', $4)
+		ON CONFLICT (chat_id, thread_id, update_id, role) DO NOTHING`,
+		key.ChatID, key.ThreadID, updateID, text); err != nil {
+		return databaseError(ctx, err, ErrDatabaseOperation)
+	}
+	return nil
 }
 
 func (s *Store) cleanupStale(ctx context.Context) error {

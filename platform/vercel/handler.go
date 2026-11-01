@@ -13,6 +13,7 @@ import (
 	"github.com/Seraf-seraf/yanineko/internal/app"
 	"github.com/Seraf-seraf/yanineko/internal/config"
 	"github.com/Seraf-seraf/yanineko/internal/domain"
+	"github.com/Seraf-seraf/yanineko/internal/knowledge"
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
@@ -34,6 +35,12 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responder := openaiadapter.New(cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAIReasoningEffort, cfg.OpenAIBaseURL)
+	memory, err := knowledge.Default()
+	if err != nil {
+		slog.ErrorContext(r.Context(), "world memory unavailable", "phase", "knowledge", "code", "knowledge_invalid")
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	handler := webhook.Handler{
 		Config:      cfg,
 		BotUsername: telegramClient.GetMe,
@@ -47,6 +54,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				SystemPrompt: cfg.SystemPrompt,
 				Store:        store,
 				Responder:    responder,
+				Memory:       memory,
 				Messenger:    telegramClient,
 			}
 			return service.Handle(ctx, incoming)

@@ -56,6 +56,21 @@ func TestLoadDefaultsReasoningEffortToLow(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsSelectedModelAndReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	values := validValues()
+	delete(values, "OPENAI_MODEL")
+	delete(values, "OPENAI_REASONING_EFFORT")
+	config, err := Load(lookup(values))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.OpenAIModel != DefaultOpenAIModel || config.OpenAIReasoningEffort != "low" {
+		t.Fatalf("model/reasoning = %q/%q, want %q/low", config.OpenAIModel, config.OpenAIReasoningEffort, DefaultOpenAIModel)
+	}
+}
+
 func TestLoadRejectsMissingAndMalformedValues(t *testing.T) {
 	t.Parallel()
 

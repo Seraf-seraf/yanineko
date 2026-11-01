@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -14,8 +15,6 @@ const AboutMessage = "Я Telegram-бот с ИИ-персонажем. В лич
 
 const ConversationLeaseDuration = 50 * time.Second
 const DeliveryLeaseDuration = 10 * time.Second
-const MaxStoredConversationMessages = 20
-const MaxContextMessages = MaxStoredConversationMessages + 1
 const MaxConversationTextBytes = 48 * 1024
 const MaxTelegramMessageRunes = domain.MaxOutgoingTextRunes
 
@@ -69,8 +68,9 @@ type DeliveryResult struct {
 
 type Store interface {
 	Begin(context.Context, domain.Incoming, time.Duration) (BeginResult, error)
-	History(context.Context, Claim) ([]domain.Message, error)
-	CommitResponse(context.Context, Claim, string) error
+	History(context.Context, Claim, int64) ([]domain.Message, error)
+	ModelContext(context.Context, Claim) (domain.ModelContext, error)
+	CommitResponse(context.Context, Claim, string, domain.ModelContext) error
 	CommitAbout(context.Context, Claim, string) error
 	ClaimDelivery(context.Context, int64, time.Duration) (DeliveryResult, error)
 	MarkSent(context.Context, Delivery, int64) error
@@ -79,7 +79,7 @@ type Store interface {
 }
 
 type Responder interface {
-	Respond(context.Context, string, []domain.Message) (string, error)
+	Respond(context.Context, domain.AgentRequest, domain.AgentMemory) (domain.AgentResult, error)
 }
 
 type Messenger interface {
@@ -90,6 +90,7 @@ type Service struct {
 	SystemPrompt string
 	Store        Store
 	Responder    Responder
+	Memory       domain.AgentMemory
 	Messenger    Messenger
 }
 
@@ -137,24 +138,36 @@ func (s Service) processClaim(ctx context.Context, claim Claim) error {
 		return s.abort(ctx, claim, errors.New("responder unavailable"))
 	}
 
-	previous, err := s.Store.History(ctx, claim)
+	modelContext, err := s.Store.ModelContext(ctx, claim)
+	if err != nil {
+		return s.abort(ctx, claim, errors.Join(errors.New("load model context failed"), err))
+	}
+	history, err := s.Store.History(ctx, claim, modelContext.ThroughMessageOrder)
 	if err != nil {
 		return s.abort(ctx, claim, errors.Join(errors.New("load conversation failed"), err))
 	}
-	history, err := prepareHistory(previous, domain.Message{Role: domain.RoleUser, Text: claim.Incoming.Text})
-	if err != nil {
-		return s.abort(ctx, claim, err)
-	}
-	response, err := s.Responder.Respond(ctx, s.SystemPrompt, history)
+	result, err := s.Responder.Respond(ctx, domain.AgentRequest{
+		Instructions: s.SystemPrompt,
+		Context:      modelContext,
+		Messages:     history,
+	}, s.Memory)
 	if err != nil {
 		return s.abort(ctx, claim, errors.Join(errors.New("response generation failed"), err))
 	}
-	response = strings.TrimSpace(response)
+	response := strings.TrimSpace(result.Text)
 	if response == "" {
 		return s.abort(ctx, claim, errors.New("empty generated response"))
 	}
+	if len(result.ItemsJSON) == 0 || !json.Valid(result.ItemsJSON) || result.ItemsJSON[0] != '[' {
+		return s.abort(ctx, claim, errors.New("generated model context is invalid"))
+	}
 	response = limitTelegramText(response)
-	if err := s.Store.CommitResponse(ctx, claim, response); err != nil {
+	modelContext = domain.ModelContext{
+		ThroughMessageOrder: modelContext.ThroughMessageOrder,
+		ItemsJSON:           result.ItemsJSON,
+		Initialized:         true,
+	}
+	if err := s.Store.CommitResponse(ctx, claim, response, modelContext); err != nil {
 		return errors.Join(errors.New("save generated response failed"), err)
 	}
 	return s.deliver(ctx, claim.Incoming.UpdateID)
@@ -198,40 +211,4 @@ func limitTelegramText(text string) string {
 		return text
 	}
 	return string([]rune(text)[:MaxTelegramMessageRunes])
-}
-
-func prepareHistory(previous []domain.Message, current domain.Message) ([]domain.Message, error) {
-	if current.Role != domain.RoleUser || strings.TrimSpace(current.Text) == "" {
-		return nil, ErrInvalidHistory
-	}
-	if len(current.Text) > MaxConversationTextBytes {
-		return nil, ErrInputTooLarge
-	}
-	if len(previous)%2 != 0 {
-		return nil, ErrInvalidHistory
-	}
-	for index := 0; index < len(previous); index += 2 {
-		if previous[index].Role != domain.RoleUser || previous[index+1].Role != domain.RoleAssistant || strings.TrimSpace(previous[index].Text) == "" || strings.TrimSpace(previous[index+1].Text) == "" {
-			return nil, ErrInvalidHistory
-		}
-	}
-	history := make([]domain.Message, 0, len(previous)+1)
-	history = append(history, previous...)
-	history = append(history, current)
-
-	for len(history) > MaxContextMessages || totalTextBytes(history) > MaxConversationTextBytes {
-		if len(history) <= 1 {
-			return nil, ErrInputTooLarge
-		}
-		history = history[2:]
-	}
-	return history, nil
-}
-
-func totalTextBytes(messages []domain.Message) int {
-	total := 0
-	for _, message := range messages {
-		total += len(message.Text)
-	}
-	return total
 }

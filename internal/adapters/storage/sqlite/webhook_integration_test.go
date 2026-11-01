@@ -157,7 +157,7 @@ func TestWebhookToSQLiteServiceEndToEnd(t *testing.T) {
 	if response := serveIntegrationUpdate(t, handler, integrationWebhookSecret, otherChat); response.Code != http.StatusOK {
 		t.Fatalf("second-chat update status = %d, want 200", response.Code)
 	}
-	if history := responder.calls[len(responder.calls)-1].history; len(history) != 1 || history[0] != (domain.Message{Role: domain.RoleUser, Text: "separate chat"}) {
+	if history := responder.calls[len(responder.calls)-1].history; len(history) != 1 || history[0].Role != domain.RoleUser || history[0].Text != "separate chat" {
 		t.Fatalf("second-chat model history = %#v, want only the current chat's input", history)
 	}
 
@@ -169,8 +169,12 @@ func TestWebhookToSQLiteServiceEndToEnd(t *testing.T) {
 		t.Fatalf("same-chat continuation status = %d, want 200", response.Code)
 	}
 	lastHistory := responder.calls[len(responder.calls)-1].history
-	if len(lastHistory) != 3 || lastHistory[0].Text != "hello" || lastHistory[1].Text != "reply-1" || lastHistory[2].Text != "continue" {
-		t.Fatalf("same-chat model history = %#v, want previous pair plus current input", lastHistory)
+	if len(lastHistory) != 1 || lastHistory[0].Role != domain.RoleUser || lastHistory[0].Text != "continue" {
+		t.Fatalf("same-chat incremental model history = %#v, want only input after prior checkpoint", lastHistory)
+	}
+	var archiveCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM conversation_messages WHERE chat_id = 101 AND thread_id = 0`).Scan(&archiveCount); err != nil || archiveCount != 4 {
+		t.Fatalf("same-chat archived messages = (%d, %v), want both full turns retained", archiveCount, err)
 	}
 }
 
@@ -188,15 +192,15 @@ type integrationResponder struct {
 	calls []integrationResponseCall
 }
 
-func (r *integrationResponder) Respond(ctx context.Context, prompt string, history []domain.Message) (string, error) {
+func (r *integrationResponder) Respond(ctx context.Context, request domain.AgentRequest, _ domain.AgentMemory) (domain.AgentResult, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return domain.AgentResult{}, err
 	}
 	r.calls = append(r.calls, integrationResponseCall{
-		prompt:  prompt,
-		history: append([]domain.Message(nil), history...),
+		prompt:  request.Instructions,
+		history: append([]domain.Message(nil), request.Messages...),
 	})
-	return "reply-" + strconv.Itoa(len(r.calls)), nil
+	return domain.AgentResult{Text: "reply-" + strconv.Itoa(len(r.calls)), ItemsJSON: []byte("[]")}, nil
 }
 
 type integrationMessenger struct {

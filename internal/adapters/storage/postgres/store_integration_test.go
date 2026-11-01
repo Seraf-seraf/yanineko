@@ -61,19 +61,30 @@ func TestPostgresStoreWithRealDriver(t *testing.T) {
 
 	first := sampleIncoming(100, 1, domain.MessageText, "first")
 	claim := beginClaimed(t, ctx, store, first)
-	if _, err := store.History(ctx, claim); err != nil {
-		t.Fatalf("empty history: %v", err)
+	if history, err := store.History(ctx, claim, 0); err != nil || len(history) != 1 || history[0].Text != first.Text {
+		t.Fatalf("initial archive = (%#v, %v), want user input before generation", history, err)
 	}
 	duplicate, err := store.Begin(ctx, first, app.ConversationLeaseDuration)
 	if err != nil || duplicate.Status != app.BeginBusy {
 		t.Fatalf("duplicate begin while claimed = (%v, %v), want busy", duplicate.Status, err)
 	}
-	if err := store.CommitResponse(ctx, claim, "first reply"); err != nil {
+	if err := store.Release(ctx, claim); err != nil {
+		t.Fatalf("release failed-generation claim: %v", err)
+	}
+	retry, err := store.Begin(ctx, first, app.ConversationLeaseDuration)
+	if err != nil || retry.Status != app.BeginClaimed {
+		t.Fatalf("retry failed-generation input = (%v, %v), want reclaimed", retry.Status, err)
+	}
+	claim = retry.Claim
+	if history, err := store.History(ctx, claim, 0); err != nil || len(history) != 1 || history[0].Text != first.Text {
+		t.Fatalf("archive after failed-generation retry = (%#v, %v), want one retained user input", history, err)
+	}
+	if err := store.CommitResponse(ctx, claim, "first reply", postgresModelContext()); err != nil {
 		t.Fatalf("commit response and history pair: %v", err)
 	}
 	history, err := store.History(ctx, app.Claim{
 		Incoming: first, OwnerToken: claim.OwnerToken, Version: claim.Version,
-	})
+	}, 0)
 	if err == nil || !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("history after lease release expected ErrLeaseLost, got %v", err)
 	}
@@ -114,9 +125,17 @@ func TestPostgresStoreWithRealDriver(t *testing.T) {
 
 	second := sampleIncoming(101, 1, domain.MessageText, "restored context")
 	secondClaim := beginClaimed(t, ctx, store, second)
-	history, err = store.History(ctx, secondClaim)
-	if err != nil || len(history) != 2 || history[0].Text != first.Text || history[1].Text != "first reply" {
-		t.Fatalf("restored history = (%#v, %v), want the persisted user/assistant pair", history, err)
+	modelContext, err := store.ModelContext(ctx, secondClaim)
+	if err != nil {
+		t.Fatalf("load model context: %v", err)
+	}
+	history, err = store.History(ctx, secondClaim, modelContext.ThroughMessageOrder)
+	if err != nil || len(history) != 2 || history[0].Text != "late delivery" || history[1].Text != second.Text {
+		t.Fatalf("incremental archive = (%#v, %v), want both late and current inputs", history, err)
+	}
+	fullArchive, err := store.History(ctx, secondClaim, 0)
+	if err != nil || len(fullArchive) != 4 || fullArchive[0].Text != first.Text || fullArchive[1].Text != "first reply" || fullArchive[len(fullArchive)-1].Text != second.Text {
+		t.Fatalf("full archive = (%#v, %v), want all accepted turns in sequence", fullArchive, err)
 	}
 	if err := store.Release(ctx, secondClaim); err != nil {
 		t.Fatalf("release restored-context claim: %v", err)
@@ -152,7 +171,7 @@ func TestPostgresStoreWithRealDriver(t *testing.T) {
 	if newClaim.Version <= staleClaim.Version || newClaim.OwnerToken == staleClaim.OwnerToken {
 		t.Fatalf("reclaimed fencing token = (%d, %q), old = (%d, %q)", newClaim.Version, newClaim.OwnerToken, staleClaim.Version, staleClaim.OwnerToken)
 	}
-	if err := store.CommitResponse(ctx, staleClaim, "stale response"); !errors.Is(err, ErrLeaseLost) {
+	if err := store.CommitResponse(ctx, staleClaim, "stale response", postgresModelContext()); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale response commit error = %v, want ErrLeaseLost", err)
 	}
 	if err := store.Release(ctx, newClaim); err != nil {
@@ -203,7 +222,7 @@ func TestPostgresStoreWithRealDriver(t *testing.T) {
 
 	testConcurrentConversations(t, ctx, store)
 	testConcurrentUpdatesInOneConversation(t, ctx, store)
-	testStorageContextLimitAndIsolation(t, ctx, store)
+	testStorageHistoryRetentionAndIsolation(t, ctx, store)
 
 	var pairCount int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE chat_id = $1 AND thread_id = $2`, first.Key.ChatID, first.Key.ThreadID).Scan(&pairCount); err != nil {
@@ -282,7 +301,7 @@ func testConcurrentUpdatesInOneConversation(t *testing.T, ctx context.Context, s
 	}
 }
 
-func testStorageContextLimitAndIsolation(t *testing.T, ctx context.Context, store *Store) {
+func testStorageHistoryRetentionAndIsolation(t *testing.T, ctx context.Context, store *Store) {
 	t.Helper()
 	for turn := range 11 {
 		turnNumber := strconv.Itoa(turn)
@@ -292,12 +311,9 @@ func testStorageContextLimitAndIsolation(t *testing.T, ctx context.Context, stor
 
 	latest := sampleIncoming(411, 5, domain.MessageText, "next")
 	claim := beginClaimed(t, ctx, store, latest)
-	history, err := store.History(ctx, claim)
-	if err != nil {
-		t.Fatalf("read trimmed conversation history: %v", err)
-	}
-	if len(history) != app.MaxStoredConversationMessages || history[0].Text != "user-1" || history[len(history)-1].Text != "assistant-10" {
-		t.Fatalf("trimmed history = %#v, want the ten newest complete pairs", history)
+	history, err := store.History(ctx, claim, 0)
+	if err != nil || len(history) != 23 || history[0].Text != "user-0" || history[len(history)-1].Text != "next" {
+		t.Fatalf("conversation archive = (%#v, %v), want all eleven replies plus current input", history, err)
 	}
 	if err := store.Release(ctx, claim); err != nil {
 		t.Fatalf("release context-limit claim: %v", err)
@@ -305,9 +321,9 @@ func testStorageContextLimitAndIsolation(t *testing.T, ctx context.Context, stor
 
 	other := sampleIncoming(412, 6, domain.MessageText, "other chat")
 	otherClaim := beginClaimed(t, ctx, store, other)
-	otherHistory, err := store.History(ctx, otherClaim)
-	if err != nil || len(otherHistory) != 0 {
-		t.Fatalf("other chat history = (%#v, %v), want empty", otherHistory, err)
+	otherHistory, err := store.History(ctx, otherClaim, 0)
+	if err != nil || len(otherHistory) != 1 || otherHistory[0].Text != "other chat" {
+		t.Fatalf("other chat archive = (%#v, %v), want only its own input", otherHistory, err)
 	}
 	if err := store.Release(ctx, otherClaim); err != nil {
 		t.Fatalf("release other-chat claim: %v", err)
@@ -317,7 +333,7 @@ func testStorageContextLimitAndIsolation(t *testing.T, ctx context.Context, stor
 func commitTurn(t *testing.T, ctx context.Context, store *Store, incoming domain.Incoming, response string) {
 	t.Helper()
 	claim := beginClaimed(t, ctx, store, incoming)
-	if err := store.CommitResponse(ctx, claim, response); err != nil {
+	if err := store.CommitResponse(ctx, claim, response, postgresModelContext()); err != nil {
 		t.Fatalf("commit turn %d: %v", incoming.UpdateID, err)
 	}
 	delivery, err := store.ClaimDelivery(ctx, incoming.UpdateID, app.DeliveryLeaseDuration)
@@ -327,6 +343,10 @@ func commitTurn(t *testing.T, ctx context.Context, store *Store, incoming domain
 	if err := store.MarkSent(ctx, delivery.Delivery, incoming.MessageID+1000); err != nil {
 		t.Fatalf("mark turn %d sent: %v", incoming.UpdateID, err)
 	}
+}
+
+func postgresModelContext() domain.ModelContext {
+	return domain.ModelContext{ItemsJSON: []byte("[]"), Initialized: true}
 }
 
 func beginClaimed(t *testing.T, ctx context.Context, store *Store, incoming domain.Incoming) app.Claim {
