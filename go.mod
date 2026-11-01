@@ -3,6 +3,7 @@ module github.com/Seraf-seraf/yanineko
 go 1.27.3
 
 require (
+	github.com/Seraf-seraf/go-toolkit v0.0.0-20260807082520-8ebcc119639b
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/openai/openai-go/v3 v3.91.0
 	turso.tech/database/tursogo v0.8.3
