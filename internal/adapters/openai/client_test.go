@@ -1,9 +1,11 @@
 package openaiadapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -198,6 +200,11 @@ func TestRespondStoresTheSameTextThatFitsTelegram(t *testing.T) {
 }
 
 func TestRespondRunsLocalWorldMemoryTool(t *testing.T) {
+	var logOutput bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
 	var responseCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -228,10 +235,10 @@ func TestRespondRunsLocalWorldMemoryTool(t *testing.T) {
 				}
 			}
 			if responseCalls.Add(1) == 1 {
-				writeResponse(w, `{"id":"resp_tool","created_at":1,"model":"model","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"search_world_memory","arguments":"{\"query\":\"кто такая Ая\"}","status":"completed"}]}`)
+				writeResponse(w, `{"id":"resp_tool","created_at":1,"model":"model","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"search_world_memory","arguments":"{\"query\":\"QUERY_ONLY_MARKER\"}","status":"completed"}],"usage":{"input_tokens":17,"input_tokens_details":{},"output_tokens":3,"output_tokens_details":{},"total_tokens":20}}`)
 				return
 			}
-			writeResponse(w, `{"id":"resp_final","created_at":2,"model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Ая — персонаж сериала."}]}]}`)
+			writeResponse(w, `{"id":"resp_final","created_at":2,"model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"RESPONSE_ONLY_MARKER"}]}],"usage":{"input_tokens":23,"input_tokens_details":{},"output_tokens":6,"output_tokens_details":{},"total_tokens":29}}`)
 		default:
 			t.Errorf("unexpected request path %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -239,13 +246,18 @@ func TestRespondRunsLocalWorldMemoryTool(t *testing.T) {
 	}))
 	defer server.Close()
 
-	memory := &fakeMemory{result: `{"facts":[{"subject":"Ая","canon":"anime"}]}`}
+	memory := &fakeMemory{result: `{"query":"RESULT_QUERY_MARKER","facts":[{"id":"anime.aya","subject":"Ая","canon":"anime","summary":"FACT_CONTENT_MARKER"}]}`}
 	client := newClient("synthetic-openai-key", "model", server.URL, server.Client())
-	result, err := client.Respond(context.Background(), requestWithUserMessage(), memory)
+	request := domain.AgentRequest{
+		UpdateID:     654,
+		Instructions: "PROMPT_ONLY_MARKER",
+		Messages:     []domain.Message{{Role: domain.RoleUser, Text: "MESSAGE_ONLY_MARKER"}},
+	}
+	result, err := client.Respond(context.Background(), request, memory)
 	if err != nil {
 		t.Fatalf("Respond() error = %v", err)
 	}
-	if result.Text != "Ая — персонаж сериала." || memory.query != "кто такая Ая" {
+	if result.Text != "RESPONSE_ONLY_MARKER" || memory.query != "QUERY_ONLY_MARKER" {
 		t.Fatalf("result/query = %q/%q", result.Text, memory.query)
 	}
 	if responseCalls.Load() != 2 {
@@ -253,6 +265,36 @@ func TestRespondRunsLocalWorldMemoryTool(t *testing.T) {
 	}
 	if !strings.Contains(string(result.ItemsJSON), "function_call_output") || !strings.Contains(string(result.ItemsJSON), "search_world_memory") {
 		t.Fatalf("opaque state lost tool exchange: %s", result.ItemsJSON)
+	}
+	logs := logOutput.String()
+	for _, expected := range []string{"\"phase\":\"memory_search\"", "\"event\":\"stage_completed\"", "\"fact_ids\":[\"anime.aya\"]", "\"update_id\":654", "\"input_tokens\":23", "\"output_tokens\":6"} {
+		if !strings.Contains(logs, expected) {
+			t.Errorf("logs do not include %q: %s", expected, logs)
+		}
+	}
+	for _, forbidden := range []string{"QUERY_ONLY_MARKER", "RESULT_QUERY_MARKER", "PROMPT_ONLY_MARKER", "MESSAGE_ONLY_MARKER", "RESPONSE_ONLY_MARKER", "FACT_CONTENT_MARKER", "synthetic-openai-key"} {
+		if strings.Contains(logs, forbidden) {
+			t.Errorf("logs contain sensitive marker %q: %s", forbidden, logs)
+		}
+	}
+}
+
+func TestRespondWithoutMemoryToolDoesNotLogSearch(t *testing.T) {
+	var logOutput bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	server := newBasicResponseServer(t, `{"id":"resp_1","created_at":1,"model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`, nil)
+	defer server.Close()
+	client := newClient("synthetic-openai-key", "model", server.URL, server.Client())
+	request := requestWithUserMessage()
+	request.UpdateID = 655
+	if _, err := client.Respond(context.Background(), request, nil); err != nil {
+		t.Fatalf("Respond() error = %v", err)
+	}
+	if strings.Contains(logOutput.String(), `"phase":"memory_search"`) {
+		t.Fatalf("logs contain a memory search phase without a call: %s", logOutput.String())
 	}
 }
 
@@ -264,7 +306,7 @@ func TestRunMemoryCallValidatesJSONAndAllowsRussianQueriesByRuneCount(t *testing
 		`{"query":"` + strings.Repeat("я", MaxMemoryQueryLength+1) + `"}`,
 		strings.Repeat("x", MaxMemoryArgumentsBytes+1),
 	} {
-		if _, err := runMemoryCall(context.Background(), memory, memoryCall{CallID: "call", Name: memoryToolName, Arguments: arguments}); !errors.Is(err, ErrInvalidRequest) {
+		if _, err := runMemoryCall(context.Background(), 0, 1, memory, memoryCall{CallID: "call", Name: memoryToolName, Arguments: arguments}); !errors.Is(err, ErrInvalidRequest) {
 			t.Errorf("runMemoryCall(invalid) error = %v, want ErrInvalidRequest", err)
 		}
 	}
@@ -273,7 +315,7 @@ func TestRunMemoryCallValidatesJSONAndAllowsRussianQueriesByRuneCount(t *testing
 	}
 
 	query := strings.Repeat("я", 600)
-	if _, err := runMemoryCall(context.Background(), memory, memoryCall{CallID: "call", Name: memoryToolName, Arguments: `{"query":"` + query + `"}`}); err != nil {
+	if _, err := runMemoryCall(context.Background(), 0, 1, memory, memoryCall{CallID: "call", Name: memoryToolName, Arguments: `{"query":"` + query + `"}`}); err != nil {
 		t.Fatalf("runMemoryCall(valid Russian query) error = %v", err)
 	}
 	if memory.query != query {

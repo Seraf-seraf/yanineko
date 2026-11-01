@@ -112,37 +112,51 @@ func NeedsBotUsername(update Update) bool {
 }
 
 func Classify(update Update, botID int64, botUsername string) (domain.Incoming, bool) {
+	incoming, accepted, _ := ClassifyWithReason(update, botID, botUsername)
+	return incoming, accepted
+}
+
+func ClassifyWithReason(update Update, botID int64, botUsername string) (domain.Incoming, bool, string) {
 	message := update.Message
-	if message == nil || message.From == nil || message.From.ID <= 0 || message.From.IsBot || message.SenderChat != nil || strings.TrimSpace(message.Text) == "" {
-		return domain.Incoming{}, false
+	if message == nil {
+		return domain.Incoming{}, false, "no_message"
+	}
+	if message.From == nil || message.From.ID <= 0 || message.From.IsBot || message.SenderChat != nil {
+		return domain.Incoming{}, false, "ineligible_sender"
+	}
+	if strings.TrimSpace(message.Text) == "" {
+		return domain.Incoming{}, false, "empty_text"
 	}
 	private := message.Chat.Type == "private"
 	group := message.Chat.Type == "group" || message.Chat.Type == "supergroup"
 	if !private && !group {
-		return domain.Incoming{}, false
+		return domain.Incoming{}, false, "unsupported_chat_type"
 	}
 
 	command, commandTarget, hasCommand := parseCommand(message)
 	if hasCommand {
 		if commandTarget != "" && !strings.EqualFold(commandTarget, botUsername) {
-			return domain.Incoming{}, false
+			return domain.Incoming{}, false, "command_for_other_bot"
 		}
 		if !strings.EqualFold(command, "about") {
-			return domain.Incoming{}, false
+			return domain.Incoming{}, false, "unsupported_command"
 		}
 		if group && commandTarget == "" && !isReplyToBot(message, botID) && !hasMention(message, botUsername) {
-			return domain.Incoming{}, false
+			return domain.Incoming{}, false, "group_command_not_addressed"
 		}
-		return incoming(update, message, domain.MessageAbout), true
+		return incoming(update, message, domain.MessageAbout), true, "about_command"
 	}
 
 	if private {
-		return incoming(update, message, domain.MessageText), true
+		return incoming(update, message, domain.MessageText), true, "private_message"
 	}
-	if isReplyToBot(message, botID) || hasMention(message, botUsername) {
-		return incoming(update, message, domain.MessageText), true
+	if isReplyToBot(message, botID) {
+		return incoming(update, message, domain.MessageText), true, "group_reply"
 	}
-	return domain.Incoming{}, false
+	if hasMention(message, botUsername) {
+		return incoming(update, message, domain.MessageText), true, "group_mention"
+	}
+	return domain.Incoming{}, false, "group_not_addressed"
 }
 
 func incoming(update Update, message *Message, kind domain.MessageKind) domain.Incoming {

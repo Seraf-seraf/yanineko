@@ -14,6 +14,7 @@ type ModelContext struct {
 }
 
 type AgentRequest struct {
+	UpdateID     int64
 	Instructions string
 	Context      ModelContext
 	Messages     []Message

@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Seraf-seraf/yanineko/internal/domain"
+	"github.com/Seraf-seraf/yanineko/internal/observability"
 )
 
 const AboutMessage = "Я Telegram-бот с ИИ-персонажем. В личных чатах отвечаю на сообщения, а в группах — когда меня упоминают или отвечают на моё сообщение."
@@ -96,29 +97,41 @@ type Service struct {
 
 func (s Service) Handle(ctx context.Context, incoming domain.Incoming) error {
 	if s.Store == nil || s.Messenger == nil {
+		observability.Start(ctx, incoming.UpdateID, "service_dependencies").Fail(ctx, "dependencies_unavailable")
 		return errors.New("service dependencies unavailable")
 	}
+	claimStage := observability.Start(ctx, incoming.UpdateID, "conversation_claim")
 	result, err := s.Store.Begin(ctx, incoming, ConversationLeaseDuration)
 	if err != nil {
+		claimStage.Fail(ctx, "store_begin_failed")
 		return errors.Join(errors.New("begin update failed"), err)
 	}
 
 	switch result.Status {
 	case BeginBusy:
+		claimStage.Warn(ctx, "conversation_busy", "status", beginStatusName(result.Status))
 		return ErrBusy
-	case BeginSent, BeginUnknown:
+	case BeginSent:
+		claimStage.Outcome(ctx, "already_processed", "status", beginStatusName(result.Status))
+		return nil
+	case BeginUnknown:
+		claimStage.Warn(ctx, "delivery_state_unknown", "status", beginStatusName(result.Status))
 		return nil
 	case BeginReady:
+		claimStage.Complete(ctx, "status", beginStatusName(result.Status))
 		err = s.deliver(ctx, result.Claim.Incoming.UpdateID)
 	case BeginClaimed:
+		claimStage.Complete(ctx, "status", beginStatusName(result.Status))
 		err = s.processClaim(ctx, result.Claim)
 	default:
+		claimStage.Fail(ctx, "invalid_begin_status")
 		return errors.New("store returned invalid begin status")
 	}
 	if err != nil {
 		return err
 	}
 	if result.RetryCurrent {
+		observability.Start(ctx, incoming.UpdateID, "conversation_retry").Warn(ctx, "retry_requested")
 		return ErrBusy
 	}
 	return nil
@@ -126,39 +139,56 @@ func (s Service) Handle(ctx context.Context, incoming domain.Incoming) error {
 
 func (s Service) processClaim(ctx context.Context, claim Claim) error {
 	if claim.Incoming.Kind == domain.MessageAbout {
+		aboutStage := observability.Start(ctx, claim.Incoming.UpdateID, "about_response_commit")
 		if err := s.Store.CommitAbout(ctx, claim, AboutMessage); err != nil {
+			aboutStage.Fail(ctx, "store_about_commit_failed")
 			return errors.Join(errors.New("save about response failed"), err)
 		}
+		aboutStage.Complete(ctx)
 		return s.deliver(ctx, claim.Incoming.UpdateID)
 	}
 	if claim.Incoming.Kind != domain.MessageText {
+		observability.Start(ctx, claim.Incoming.UpdateID, "message_validation").Fail(ctx, "unsupported_message_kind")
 		return s.abort(ctx, claim, errors.New("unsupported message kind"))
 	}
 	if s.Responder == nil {
+		observability.Start(ctx, claim.Incoming.UpdateID, "response_generation").Fail(ctx, "responder_unavailable")
 		return s.abort(ctx, claim, errors.New("responder unavailable"))
 	}
 
+	modelContextStage := observability.Start(ctx, claim.Incoming.UpdateID, "model_context_load")
 	modelContext, err := s.Store.ModelContext(ctx, claim)
 	if err != nil {
+		modelContextStage.Fail(ctx, "model_context_load_failed")
 		return s.abort(ctx, claim, errors.Join(errors.New("load model context failed"), err))
 	}
+	modelContextStage.Complete(ctx, "initialized", modelContext.Initialized, "through_message_order", modelContext.ThroughMessageOrder)
+	historyStage := observability.Start(ctx, claim.Incoming.UpdateID, "conversation_history_load")
 	history, err := s.Store.History(ctx, claim, modelContext.ThroughMessageOrder)
 	if err != nil {
+		historyStage.Fail(ctx, "conversation_history_load_failed")
 		return s.abort(ctx, claim, errors.Join(errors.New("load conversation failed"), err))
 	}
+	historyStage.Complete(ctx, "message_count", len(history))
+	responseStage := observability.Start(ctx, claim.Incoming.UpdateID, "response_generation")
 	result, err := s.Responder.Respond(ctx, domain.AgentRequest{
+		UpdateID:     claim.Incoming.UpdateID,
 		Instructions: s.SystemPrompt,
 		Context:      modelContext,
 		Messages:     history,
 	}, s.Memory)
 	if err != nil {
+		responseStage.Outcome(ctx, "failed", "code", "response_generation_failed")
 		return s.abort(ctx, claim, errors.Join(errors.New("response generation failed"), err))
 	}
+	responseStage.Complete(ctx)
 	response := strings.TrimSpace(result.Text)
 	if response == "" {
+		observability.Start(ctx, claim.Incoming.UpdateID, "response_validation").Fail(ctx, "empty_response")
 		return s.abort(ctx, claim, errors.New("empty generated response"))
 	}
 	if len(result.ItemsJSON) == 0 || !json.Valid(result.ItemsJSON) || result.ItemsJSON[0] != '[' {
+		observability.Start(ctx, claim.Incoming.UpdateID, "response_validation").Fail(ctx, "invalid_model_context")
 		return s.abort(ctx, claim, errors.New("generated model context is invalid"))
 	}
 	response = limitTelegramText(response)
@@ -167,42 +197,102 @@ func (s Service) processClaim(ctx context.Context, claim Claim) error {
 		ItemsJSON:           result.ItemsJSON,
 		Initialized:         true,
 	}
+	commitStage := observability.Start(ctx, claim.Incoming.UpdateID, "response_commit")
 	if err := s.Store.CommitResponse(ctx, claim, response, modelContext); err != nil {
+		commitStage.Fail(ctx, "response_commit_failed")
 		return errors.Join(errors.New("save generated response failed"), err)
 	}
+	commitStage.Complete(ctx, "response_runes", len([]rune(response)), "model_context_bytes", len(modelContext.ItemsJSON))
 	return s.deliver(ctx, claim.Incoming.UpdateID)
 }
 
 func (s Service) deliver(ctx context.Context, updateID int64) error {
+	claimStage := observability.Start(ctx, updateID, "delivery_claim")
 	result, err := s.Store.ClaimDelivery(ctx, updateID, DeliveryLeaseDuration)
 	if err != nil {
+		claimStage.Fail(ctx, "delivery_claim_failed")
 		return errors.Join(errors.New("claim telegram delivery failed"), err)
 	}
 	switch result.Status {
 	case DeliveryBusy:
+		claimStage.Warn(ctx, "delivery_busy", "status", deliveryStatusName(result.Status))
 		return ErrBusy
 	case DeliverySent, DeliveryUnknownState:
+		if result.Status == DeliverySent {
+			claimStage.Outcome(ctx, "already_sent", "status", deliveryStatusName(result.Status))
+		} else {
+			claimStage.Warn(ctx, "delivery_state_unknown", "status", deliveryStatusName(result.Status))
+		}
 		return nil
 	case DeliveryClaimed:
+		claimStage.Complete(ctx, "status", deliveryStatusName(result.Status))
 	default:
+		claimStage.Fail(ctx, "invalid_delivery_status")
 		return errors.New("store returned invalid delivery status")
 	}
 
+	sendStage := observability.Start(ctx, updateID, "telegram_send")
 	messageID, err := s.Messenger.Send(ctx, result.Delivery.Outgoing)
 	if err != nil || messageID <= 0 {
+		sendStage.Fail(ctx, "telegram_send_failed")
+		unknownStage := observability.Start(ctx, updateID, "delivery_mark_unknown")
 		markErr := s.Store.MarkDeliveryUnknown(ctx, result.Delivery)
+		if markErr != nil {
+			unknownStage.Fail(ctx, "delivery_unknown_mark_failed")
+		} else {
+			unknownStage.Complete(ctx)
+		}
 		return errors.Join(ErrDeliveryUnknown, err, markErr)
 	}
+	sendStage.Complete(ctx)
+	markSentStage := observability.Start(ctx, updateID, "delivery_mark_sent")
 	if err := s.Store.MarkSent(ctx, result.Delivery, messageID); err != nil {
+		markSentStage.Fail(ctx, "delivery_sent_mark_failed")
 		return errors.Join(errors.New("save telegram delivery result failed"), err)
 	}
+	markSentStage.Complete(ctx)
 	return nil
 }
 
+func beginStatusName(status BeginStatus) string {
+	switch status {
+	case BeginClaimed:
+		return "claimed"
+	case BeginReady:
+		return "delivery_ready"
+	case BeginSent:
+		return "already_sent"
+	case BeginBusy:
+		return "busy"
+	case BeginUnknown:
+		return "unknown"
+	default:
+		return "invalid"
+	}
+}
+
+func deliveryStatusName(status DeliveryStatus) string {
+	switch status {
+	case DeliveryClaimed:
+		return "claimed"
+	case DeliveryBusy:
+		return "busy"
+	case DeliverySent:
+		return "sent"
+	case DeliveryUnknownState:
+		return "unknown"
+	default:
+		return "invalid"
+	}
+}
+
 func (s Service) abort(ctx context.Context, claim Claim, cause error) error {
+	releaseStage := observability.Start(ctx, claim.Incoming.UpdateID, "conversation_claim_release")
 	if err := s.Store.Release(ctx, claim); err != nil {
+		releaseStage.Fail(ctx, "claim_release_failed")
 		return errors.Join(cause, err)
 	}
+	releaseStage.Complete(ctx)
 	return cause
 }
 

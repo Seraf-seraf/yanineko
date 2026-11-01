@@ -1,9 +1,11 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -71,6 +73,59 @@ func TestServeHTTPRejectsOversizedAndMalformedBodies(t *testing.T) {
 				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
 			}
 		})
+	}
+}
+
+func TestServeHTTPLogsGroupDecisionAndSanitizesProcessingFailure(t *testing.T) {
+	var logOutput bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	ignored := Handler{Config: testConfig()}
+	ignoredResponse := httptest.NewRecorder()
+	ignored.ServeHTTP(ignoredResponse, authenticatedRequest(messageJSON(71, "group", "PRIVATE_MESSAGE_MARKER", "", false, false)))
+	if ignoredResponse.Code != http.StatusOK {
+		t.Fatalf("ignored update status = %d, want 200", ignoredResponse.Code)
+	}
+	if !strings.Contains(logOutput.String(), `"reason":"group_not_addressed"`) || !strings.Contains(logOutput.String(), `"chat_type":"supergroup"`) {
+		t.Fatalf("logs do not explain the group classification: %s", logOutput.String())
+	}
+
+	logOutput.Reset()
+	accepted := Handler{
+		Config: testConfig(),
+		BotUsername: func(context.Context) (string, error) {
+			return "yanineko", nil
+		},
+		Process: func(context.Context, domain.Incoming) error { return nil },
+	}
+	acceptedResponse := httptest.NewRecorder()
+	accepted.ServeHTTP(acceptedResponse, authenticatedRequest(messageJSON(73, "group", "@yanineko hello", "", false, false)))
+	if acceptedResponse.Code != http.StatusOK || !strings.Contains(logOutput.String(), `"reason":"group_mention"`) {
+		t.Fatalf("accepted group mention status/logs = %d/%s", acceptedResponse.Code, logOutput.String())
+	}
+
+	logOutput.Reset()
+	failed := Handler{
+		Config: testConfig(),
+		Process: func(context.Context, domain.Incoming) error {
+			return errors.New("PRIVATE_ERROR_MARKER")
+		},
+	}
+	failedResponse := httptest.NewRecorder()
+	failed.ServeHTTP(failedResponse, authenticatedRequest(messageJSON(72, "private", "PRIVATE_MESSAGE_MARKER", "", false, false)))
+	if failedResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failed update status = %d, want 503", failedResponse.Code)
+	}
+	logs := logOutput.String()
+	if !strings.Contains(logs, `"phase":"update_processing"`) || !strings.Contains(logs, `"outcome":"failed"`) {
+		t.Fatalf("logs do not report processing failure: %s", logs)
+	}
+	for _, forbidden := range []string{"PRIVATE_MESSAGE_MARKER", "PRIVATE_ERROR_MARKER"} {
+		if strings.Contains(logs, forbidden) {
+			t.Errorf("logs contain sensitive marker %q: %s", forbidden, logs)
+		}
 	}
 }
 

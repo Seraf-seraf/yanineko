@@ -60,6 +60,9 @@ func TestHandleTextPassesPromptAndHistoryAndPersistsResponse(t *testing.T) {
 	if responder.request.Instructions != service.SystemPrompt {
 		t.Fatalf("prompt = %q, want exact configured prompt", responder.request.Instructions)
 	}
+	if responder.request.UpdateID != input.UpdateID {
+		t.Fatalf("request update ID = %d, want %d", responder.request.UpdateID, input.UpdateID)
+	}
 	wantHistory := []domain.Message{
 		{UpdateID: 40, ArchiveOrder: 1, Role: domain.RoleUser, Text: "Как дела?"},
 		{UpdateID: 40, ArchiveOrder: 2, Role: domain.RoleAssistant, Text: "Хорошо."},
