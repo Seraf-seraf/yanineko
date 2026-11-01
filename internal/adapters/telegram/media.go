@@ -455,7 +455,7 @@ func videoDecodeArgs() []string {
 		"-nostdin", "-v", "error",
 		"-protocol_whitelist", "pipe",
 		"-max_pixels", strconv.Itoa(MaxMediaPixels),
-		"-threads", "1",
+		"-threads", "0",
 		"-t", strconv.FormatFloat(MaxStickerVideoDuration.Seconds(), 'f', -1, 64),
 		"-i", "pipe:0",
 		"-vf", "fps=1.333,scale='min(512,iw)':'min(512,ih)':force_original_aspect_ratio=decrease",

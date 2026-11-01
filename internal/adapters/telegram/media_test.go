@@ -184,7 +184,7 @@ func TestVideoDecodeArgsBoundInputDecoder(t *testing.T) {
 	}{
 		{option: "-protocol_whitelist", value: "pipe"},
 		{option: "-max_pixels", value: strconv.Itoa(MaxMediaPixels)},
-		{option: "-threads", value: "1"},
+		{option: "-threads", value: "0"},
 	} {
 		optionIndex := -1
 		for index, argument := range args {
