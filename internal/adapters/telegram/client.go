@@ -16,6 +16,7 @@ import (
 )
 
 const RequestTimeout = 6 * time.Second
+const MediaFetchTimeout = 10 * time.Second
 const MaxResponseBytes int64 = 1 << 20
 const MaxMessageRunes = domain.MaxOutgoingTextRunes
 
@@ -69,7 +70,6 @@ func NewClient(token string, expectedBotID int64) (*Client, error) {
 		return nil, ErrInvalidTelegramRequest
 	}
 	httpClient := &http.Client{
-		Timeout: RequestTimeout,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
