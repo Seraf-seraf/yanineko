@@ -16,8 +16,10 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -37,11 +39,14 @@ const MaxVisionRequestBytes int64 = 10 << 20
 const MaxVisionFrameBytes int64 = MaxVisionRequestBytes / MaxVisionFrames
 const MaxTGSJSONBytes int64 = 2 << 20
 const MaxFrameStreamBytes int64 = 8 << 20
-const MediaFetchTimeout = 4 * time.Second
 const MaxStickerVideoDuration = 3 * time.Second
 const MaxTGSAnimationDuration = 3100 * time.Millisecond
+const bundledFFmpegPath = "third_party/ffmpeg/ffmpeg"
 
-var ErrInvalidMedia = errors.New("invalid Telegram media")
+var (
+	ErrInvalidMedia            = errors.New("invalid Telegram media")
+	ErrMediaDecoderUnavailable = errors.New("media decoder unavailable")
+)
 
 type telegramFile struct {
 	Path     string `json:"file_path"`
@@ -419,9 +424,9 @@ func mediaDecodeError(ctx context.Context) error {
 }
 
 func decodeVideoFrames(ctx context.Context, data []byte) ([][]byte, error) {
-	ffmpeg, err := exec.LookPath("ffmpeg")
+	ffmpeg, err := findFFmpeg(ffmpegBundleRoots())
 	if err != nil {
-		return nil, ErrInvalidMedia
+		return nil, err
 	}
 	command := exec.CommandContext(ctx, ffmpeg, videoDecodeArgs()...)
 	command.Stdin = bytes.NewReader(data)
@@ -448,6 +453,34 @@ func decodeVideoFrames(ctx context.Context, data []byte) ([][]byte, error) {
 		frames = append(frames, frame)
 	}
 	return encodeImageFrames(frames)
+}
+
+func ffmpegBundleRoots() []string {
+	roots := make([]string, 0, 3)
+	if taskRoot := os.Getenv("LAMBDA_TASK_ROOT"); taskRoot != "" {
+		roots = append(roots, taskRoot)
+	}
+	if workingDirectory, err := os.Getwd(); err == nil {
+		roots = append(roots, workingDirectory)
+	}
+	if executable, err := os.Executable(); err == nil {
+		roots = append(roots, filepath.Dir(executable))
+	}
+	return roots
+}
+
+func findFFmpeg(bundleRoots []string) (string, error) {
+	for _, root := range bundleRoots {
+		candidate := filepath.Join(root, bundledFFmpegPath)
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	if binary, err := exec.LookPath("ffmpeg"); err == nil {
+		return binary, nil
+	}
+	return "", ErrMediaDecoderUnavailable
 }
 
 func videoDecodeArgs() []string {

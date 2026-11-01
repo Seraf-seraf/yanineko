@@ -94,7 +94,11 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			mediaStage.Outcome(ctx, "unavailable", "code", "media_load_failed")
+			mediaCode := "media_load_failed"
+			if errors.Is(mediaErr, telegram.ErrMediaDecoderUnavailable) {
+				mediaCode = "media_decoder_unavailable"
+			}
+			mediaStage.Outcome(ctx, "unavailable", "code", mediaCode)
 			incoming.MediaUnavailable = true
 		} else {
 			mediaStage.Complete(ctx, "frame_count", len(images))

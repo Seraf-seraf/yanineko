@@ -22,7 +22,7 @@
 - Vercel CLI для локального `vercel dev`.
 - Удалённая SQLite-совместимая база Turso для работы в Vercel. Файловое SQLite-хранилище в каталоге функции непостоянно и не подходит для диалоговой истории.
 - Telegram bot token и отдельный OpenAI API key.
-- Для извлечения кадров из видеоанимаций и WEBM-стикеров используется `ffmpeg`, если он доступен в runtime; при его отсутствии бот использует миниатюру, если Telegram её предоставил.
+- Для извлечения кадров из GIF-видеоанимаций и WEBM-стикеров Vercel-функция включает закреплённый компактный LGPL-сборочный `ffmpeg`. В остальных средах сначала используется бинарник из каталога сборки, затем `ffmpeg` из `PATH`; при отсутствии декодера бот использует миниатюру, если Telegram её предоставил. Сборка и лицензия поставляемого бинарника описаны в [third_party/ffmpeg](third_party/ffmpeg/README.md).
 
 Runtime использует прямой Turso HTTP-драйвер и переменные `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`. База Turso в этом репозитории или в Vercel аккаунте не создавалась. PostgreSQL адаптер сохранён в `internal/adapters/storage/postgres` как альтернативный; текущий Vercel composition root его не вызывает. `DATABASE_URL` не переключает runtime на PostgreSQL.
 

@@ -13,6 +13,9 @@ import (
 	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -76,6 +79,63 @@ func TestDecodeMediaFramesReturnsSeveralGIFFrames(t *testing.T) {
 	}
 	if len(frames) != 2 {
 		t.Fatalf("decoded frames = %d, want 2", len(frames))
+	}
+}
+
+func TestDecodeVideoFramesUsesBundledFFmpegForTelegramAnimations(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("bundled FFmpeg targets Linux x86_64")
+	}
+	functionRoot, err := filepath.Abs("../../../")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LAMBDA_TASK_ROOT", functionRoot)
+	t.Setenv("PATH", t.TempDir())
+
+	ffmpeg, err := findFFmpeg(ffmpegBundleRoots())
+	if err != nil {
+		t.Fatalf("findFFmpeg() error = %v", err)
+	}
+	wantFFmpeg := filepath.Join(functionRoot, bundledFFmpegPath)
+	if ffmpeg != wantFFmpeg {
+		t.Fatalf("findFFmpeg() = %q, want bundled binary %q", ffmpeg, wantFFmpeg)
+	}
+
+	fixtures := []struct {
+		name string
+		kind string
+	}{
+		{name: "tiny-h264-animation.bin", kind: "animation"},
+		{name: "tiny-vp9-sticker.bin", kind: "video"},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", fixture.name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			frames, err := decodeMediaFrames(context.Background(), fixture.kind, data)
+			if err != nil {
+				t.Fatalf("decodeMediaFrames() error = %v", err)
+			}
+			if len(frames) != MaxVisionFrames {
+				t.Fatalf("decoded frames = %d, want %d", len(frames), MaxVisionFrames)
+			}
+			for index, frame := range frames {
+				decoded, format, err := image.Decode(bytes.NewReader(frame))
+				if err != nil || format != "png" || decoded.Bounds().Dx() > MaxVisionDimension || decoded.Bounds().Dy() > MaxVisionDimension {
+					t.Errorf("frame %d = %s %v %#v, want bounded PNG", index, format, err, decoded)
+				}
+			}
+		})
+	}
+}
+
+func TestFindFFmpegReportsMissingDecoder(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	if _, err := findFFmpeg(nil); !errors.Is(err, ErrMediaDecoderUnavailable) {
+		t.Fatalf("findFFmpeg() error = %v, want ErrMediaDecoderUnavailable", err)
 	}
 }
 
