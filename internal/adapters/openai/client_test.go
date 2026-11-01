@@ -3,6 +3,7 @@ package openaiadapter
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -99,6 +100,50 @@ func TestRespondUsesResponsesAPIAndReturnsOpaqueState(t *testing.T) {
 	}
 	if !json.Valid(got.ItemsJSON) || got.ItemsJSON[0] != '[' {
 		t.Fatalf("Respond().ItemsJSON = %s, want JSON array", got.ItemsJSON)
+	}
+}
+
+func TestDescribeSendsImageAsDataURLAndReturnsText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/responses") {
+			t.Errorf("request path = %s, want /responses", r.URL.Path)
+		}
+		var request struct {
+			Input []struct {
+				Content []map[string]string `json:"content"`
+			} `json:"input"`
+			Store bool `json:"store"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode image description request: %v", err)
+		}
+		if request.Store || len(request.Input) != 1 || len(request.Input[0].Content) != 2 || request.Input[0].Content[1]["type"] != "input_image" {
+			t.Errorf("description request structure = %#v, want stateless user image input", request)
+		} else {
+			imageURL := request.Input[0].Content[1]["image_url"]
+			prefix := "data:image/png;base64,"
+			if !strings.HasPrefix(imageURL, prefix) {
+				t.Errorf("image_url = %q, want PNG data URL", imageURL)
+			} else if decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(imageURL, prefix)); err != nil || string(decoded) != "private-frame-marker" {
+				t.Errorf("decoded image data = %q, %v", decoded, err)
+			}
+		}
+		writeResponse(w, `{"id":"resp_media","created_at":1,"model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"На картинке чёрная кошка."}]}]}`)
+	}))
+	defer server.Close()
+	client := newClient("synthetic-openai-key", "model", server.URL, server.Client())
+	description, err := client.Describe(context.Background(), 22, []domain.Image{{Data: []byte("private-frame-marker"), MIMEType: "image/png"}})
+	if err != nil || description != "На картинке чёрная кошка." {
+		t.Fatalf("Describe() = (%q, %v), want text description", description, err)
+	}
+}
+
+func TestDescribeRejectsIncompleteResponse(t *testing.T) {
+	server := newBasicResponseServer(t, `{"id":"resp_media","created_at":1,"model":"model","status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"частичное описание"}]}]}`, nil)
+	defer server.Close()
+	client := newClient("synthetic-openai-key", "model", server.URL, server.Client())
+	if _, err := client.Describe(context.Background(), 23, []domain.Image{{Data: []byte("frame"), MIMEType: "image/png"}}); !errors.Is(err, ErrIncompleteResponse) {
+		t.Fatalf("Describe() error = %v, want incomplete response", err)
 	}
 }
 

@@ -59,6 +59,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	handler := webhook.Handler{
 		Config:      cfg,
 		BotUsername: telegramClient.GetMe,
+		LoadMedia:   telegramClient.LoadMedia,
 		Process: func(ctx context.Context, incoming domain.Incoming) error {
 			store, err := sqlite.Open(ctx, cfg.TursoDatabaseURL, cfg.TursoAuthToken)
 			if err != nil {
@@ -67,11 +68,12 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 			defer store.Close()
 			service := app.Service{
-				SystemPrompt: cfg.SystemPrompt,
-				Store:        store,
-				Responder:    responder,
-				Memory:       memory,
-				Messenger:    telegramClient,
+				SystemPrompt:   cfg.SystemPrompt,
+				Store:          store,
+				Responder:      responder,
+				MediaDescriber: responder,
+				Memory:         memory,
+				Messenger:      telegramClient,
 			}
 			return service.Handle(ctx, incoming)
 		},

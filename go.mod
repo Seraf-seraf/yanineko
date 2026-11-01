@@ -6,6 +6,8 @@ require (
 	github.com/Seraf-seraf/go-toolkit v0.0.0-20260807082520-8ebcc119639b
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/openai/openai-go/v3 v3.91.0
+	github.com/xo/lottie v0.1.0
+	golang.org/x/image v0.37.0
 	turso.tech/database/tursogo v0.8.3
 	turso.tech/database/tursogo-serverless v0.0.0-20261031181918-8193b02478d3
 )
@@ -16,6 +18,7 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
+	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/tidwall/gjson v1.19.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect

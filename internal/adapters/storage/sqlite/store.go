@@ -363,6 +363,47 @@ func (s *Store) History(ctx context.Context, claim app.Claim, afterUpdateID int6
 	return history, nil
 }
 
+func (s *Store) UpdateUserMessage(ctx context.Context, claim app.Claim, content string) error {
+	if !validClaim(claim) || claim.Incoming.Kind != domain.MessageText || strings.TrimSpace(content) == "" ||
+		len(content) > app.MaxConversationTextBytes || !utf8.ValidString(content) || strings.ContainsRune(content, '\x00') {
+		return ErrDatabaseConfiguration
+	}
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return databaseError(ctx, err, ErrDatabaseOperation)
+	}
+	defer func() { _ = tx.Rollback() }()
+	conversation, err := loadConversation(ctx, tx, claim.Incoming.Key)
+	if err != nil {
+		return err
+	}
+	update, err := loadUpdate(ctx, tx, claim.Incoming.UpdateID)
+	if err != nil {
+		return safeQueryError(ctx, err)
+	}
+	if !claimOwns(conversation, update, claim) {
+		return ErrLeaseLost
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE conversation_messages SET content = ?
+		WHERE chat_id = ? AND thread_id = ? AND update_id = ? AND role = 'user'`,
+		content, claim.Incoming.Key.ChatID, claim.Incoming.Key.ThreadID, claim.Incoming.UpdateID)
+	if err != nil {
+		return databaseError(ctx, err, ErrDatabaseOperation)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return databaseError(ctx, err, ErrDatabaseOperation)
+	}
+	if rows != 1 {
+		return ErrLeaseLost
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return databaseError(ctx, err, ErrDatabaseOperation)
+	}
+	return nil
+}
+
 func (s *Store) ModelContext(ctx context.Context, claim app.Claim) (domain.ModelContext, error) {
 	if !validClaim(claim) || claim.Incoming.Kind != domain.MessageText {
 		return domain.ModelContext{}, ErrLeaseLost

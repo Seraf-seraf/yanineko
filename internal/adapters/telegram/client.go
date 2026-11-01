@@ -125,11 +125,16 @@ func (c *Client) Send(ctx context.Context, outgoing domain.Outgoing) (int64, err
 }
 
 func (c *Client) call(ctx context.Context, method string, requestBody any, result any) error {
-	if c == nil || c.httpClient == nil || c.baseURL == "" || !validBotToken(c.token, c.expectedBotID) || (method != "getMe" && method != "sendMessage") {
+	return c.callWithTimeout(ctx, method, requestBody, result, RequestTimeout)
+}
+
+func (c *Client) callWithTimeout(ctx context.Context, method string, requestBody any, result any, timeout time.Duration) error {
+	if c == nil || c.httpClient == nil || c.baseURL == "" || !validBotToken(c.token, c.expectedBotID) ||
+		(method != "getMe" && method != "sendMessage" && method != "getFile") {
 		return ErrInvalidTelegramRequest
 	}
 
-	requestContext, cancel := context.WithTimeout(ctx, RequestTimeout)
+	requestContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var body io.Reader

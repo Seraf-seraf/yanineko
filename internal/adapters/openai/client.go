@@ -2,6 +2,7 @@ package openaiadapter
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -29,6 +30,10 @@ const MaxMemoryQueryLength = 1000
 const MaxMemoryQueryBytes = 4096
 const MaxMemoryArgumentsBytes = 8 * 1024
 const MaxMemoryResultBytes = 12 * 1024
+const MaxMediaImageBytes = 4 << 20
+const MaxMediaRequestBytes = 10 << 20
+const MaxMediaDescriptionRunes = 800
+const MediaDescriptionTimeout = 10 * time.Second
 
 var ErrInvalidRequest = errors.New("invalid OpenAI request")
 var ErrRequestFailed = errors.New("OpenAI request failed")
@@ -150,6 +155,63 @@ func (c *Client) Respond(ctx context.Context, request domain.AgentRequest, memor
 			memoryCalls++
 		}
 	}
+}
+
+// Describe produces a text-only description so image bytes never enter the
+// archived conversation or the persisted Responses API context.
+func (c *Client) Describe(ctx context.Context, updateID int64, images []domain.Image) (string, error) {
+	if c == nil || c.model == "" || len(images) == 0 || len(images) > 4 {
+		return "", ErrInvalidRequest
+	}
+	content := responses.ResponseInputMessageContentListParam{
+		responses.ResponseInputContentParamOfInputText("Опиши кратко изображения и последовательность кадров: видимые объекты, текст и заметные действия. Не додумывай невидимые детали."),
+	}
+	encodedBytes := int64(0)
+	for _, image := range images {
+		if image.MIMEType != "image/png" || len(image.Data) == 0 || len(image.Data) > MaxMediaImageBytes {
+			return "", ErrInvalidRequest
+		}
+		encodedBytes += int64(len(image.Data))
+		if encodedBytes > MaxMediaRequestBytes {
+			return "", ErrInvalidRequest
+		}
+		imageContent := responses.ResponseInputContentParamOfInputImage(responses.ResponseInputImageDetailAuto)
+		imageContent.OfInputImage.ImageURL = param.NewOpt("data:" + image.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(image.Data))
+		content = append(content, imageContent)
+	}
+	stage := observability.Start(ctx, updateID, "openai_media_description")
+	requestContext, cancel := context.WithTimeout(ctx, MediaDescriptionTimeout)
+	defer cancel()
+	response, err := c.sdk.Responses.New(requestContext, responses.ResponseNewParams{
+		Instructions: param.NewOpt("Ты описываешь пользовательские изображения для сохранения в текстовой истории диалога."),
+		Input: responses.ResponseNewParamsInputUnion{OfInputItemList: responses.ResponseInputParam{
+			responses.ResponseInputItemParamOfMessage(content, responses.EasyInputMessageRoleUser),
+		}},
+		MaxOutputTokens: param.NewOpt[int64](512),
+		Model:           shared.ResponsesModel(c.model),
+		Store:           param.NewOpt(false),
+		Truncation:      responses.ResponseNewParamsTruncationDisabled,
+	})
+	if err != nil {
+		requestErr := apiError(err)
+		stage.Fail(ctx, openAIErrorCode(requestErr), openAIStatusFields(requestErr)...)
+		return "", requestErr
+	}
+	if response == nil || response.Status != responses.ResponseStatusCompleted {
+		stage.Fail(ctx, "incomplete_response", "response_status", responseStatus(response))
+		return "", ErrIncompleteResponse
+	}
+	description := strings.TrimSpace(response.OutputText())
+	if description == "" {
+		stage.Fail(ctx, "empty_description")
+		return "", ErrEmptyResponse
+	}
+	runes := []rune(description)
+	if len(runes) > MaxMediaDescriptionRunes {
+		description = string(runes[:MaxMediaDescriptionRunes])
+	}
+	stage.Complete(ctx, "image_count", len(images), "description_runes", len([]rune(description)))
+	return description, nil
 }
 
 func (c *Client) prepareInput(ctx context.Context, updateID int64, instructions string, items []responses.ResponseInputItemUnionParam, tools []responses.ToolUnionParam, attempt int) ([]responses.ResponseInputItemUnionParam, error) {

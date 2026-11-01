@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 
+	"github.com/Seraf-seraf/yanineko/internal/adapters/telegram"
 	"github.com/Seraf-seraf/yanineko/internal/config"
 	"github.com/Seraf-seraf/yanineko/internal/domain"
 )
@@ -133,8 +134,9 @@ func TestServeHTTPIgnoresUnsupportedAndUnaddressedUpdates(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		body string
+		name      string
+		body      string
+		wantCalls int
 	}{
 		{name: "edited message", body: `{"update_id":1,"edited_message":{"message_id":1}}`},
 		{name: "channel post", body: `{"update_id":2,"channel_post":{"message_id":1}}`},
@@ -142,7 +144,7 @@ func TestServeHTTPIgnoresUnsupportedAndUnaddressedUpdates(t *testing.T) {
 		{name: "lookalike bot mention", body: messageJSON(6, "group", "@yanineko_cat_bot_backup привет", "", false, false)},
 		{name: "bot mention inside email", body: messageJSON(7, "group", "mail@yanineko_cat_bot", "", false, false)},
 		{name: "bot message", body: messageJSON(4, "private", "hello", "", true, false)},
-		{name: "non-text update", body: `{"update_id":5,"message":{"message_id":1,"chat":{"id":1,"type":"private"},"from":{"id":2,"is_bot":false},"photo":[{}]}}`},
+		{name: "private photo without caption", body: `{"update_id":5,"message":{"message_id":1,"chat":{"id":1,"type":"private"},"from":{"id":2,"is_bot":false},"photo":[{}]}}`, wantCalls: 1},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -163,8 +165,8 @@ func TestServeHTTPIgnoresUnsupportedAndUnaddressedUpdates(t *testing.T) {
 			if response.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200", response.Code)
 			}
-			if calls != 0 {
-				t.Fatalf("processor calls = %d, want 0", calls)
+			if calls != test.wantCalls {
+				t.Fatalf("processor calls = %d, want %d", calls, test.wantCalls)
 			}
 		})
 	}
@@ -213,6 +215,31 @@ func TestServeHTTPDispatchesPrivateTextAndGroupMentionOrReply(t *testing.T) {
 				t.Fatalf("incoming kind = %d, want text", got.Kind)
 			}
 		})
+	}
+}
+
+func TestServeHTTPMarksMediaLoadFailureWithoutChangingUpdateText(t *testing.T) {
+	t.Parallel()
+
+	const body = `{"update_id":24,"message":{"message_id":12,"chat":{"id":42,"type":"private"},"from":{"id":7,"is_bot":false},"caption":"Что на фото?","photo":[{}]}}`
+	var incoming domain.Incoming
+	handler := Handler{
+		Config: testConfig(),
+		LoadMedia: func(context.Context, telegram.Update) ([]domain.Image, error) {
+			return nil, errors.New("private media fetch error")
+		},
+		Process: func(_ context.Context, got domain.Incoming) error {
+			incoming = got
+			return nil
+		},
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authenticatedRequest(body))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	if incoming.Text != "Что на фото?" || !incoming.MediaUnavailable {
+		t.Fatalf("incoming = %#v, want unchanged caption and transient media failure flag", incoming)
 	}
 }
 

@@ -18,6 +18,7 @@ const ConversationLeaseDuration = 50 * time.Second
 const DeliveryLeaseDuration = 10 * time.Second
 const MaxConversationTextBytes = 48 * 1024
 const MaxTelegramMessageRunes = domain.MaxOutgoingTextRunes
+const MediaResponseTimeout = 22 * time.Second
 
 var ErrBusy = errors.New("conversation update is already processing")
 var ErrDeliveryUnknown = errors.New("telegram delivery status is unknown")
@@ -69,6 +70,7 @@ type DeliveryResult struct {
 
 type Store interface {
 	Begin(context.Context, domain.Incoming, time.Duration) (BeginResult, error)
+	UpdateUserMessage(context.Context, Claim, string) error
 	History(context.Context, Claim, int64) ([]domain.Message, error)
 	ModelContext(context.Context, Claim) (domain.ModelContext, error)
 	CommitResponse(context.Context, Claim, string, domain.ModelContext) error
@@ -83,16 +85,21 @@ type Responder interface {
 	Respond(context.Context, domain.AgentRequest, domain.AgentMemory) (domain.AgentResult, error)
 }
 
+type MediaDescriber interface {
+	Describe(context.Context, int64, []domain.Image) (string, error)
+}
+
 type Messenger interface {
 	Send(context.Context, domain.Outgoing) (int64, error)
 }
 
 type Service struct {
-	SystemPrompt string
-	Store        Store
-	Responder    Responder
-	Memory       domain.AgentMemory
-	Messenger    Messenger
+	SystemPrompt   string
+	Store          Store
+	Responder      Responder
+	MediaDescriber MediaDescriber
+	Memory         domain.AgentMemory
+	Messenger      Messenger
 }
 
 func (s Service) Handle(ctx context.Context, incoming domain.Incoming) error {
@@ -122,6 +129,10 @@ func (s Service) Handle(ctx context.Context, incoming domain.Incoming) error {
 		err = s.deliver(ctx, result.Claim.Incoming.UpdateID)
 	case BeginClaimed:
 		claimStage.Complete(ctx, "status", beginStatusName(result.Status))
+		if result.Claim.Incoming.UpdateID == incoming.UpdateID {
+			result.Claim.Incoming.Images = incoming.Images
+			result.Claim.Incoming.MediaUnavailable = incoming.MediaUnavailable
+		}
 		err = s.processClaim(ctx, result.Claim)
 	default:
 		claimStage.Fail(ctx, "invalid_begin_status")
@@ -155,6 +166,34 @@ func (s Service) processClaim(ctx context.Context, claim Claim) error {
 		observability.Start(ctx, claim.Incoming.UpdateID, "response_generation").Fail(ctx, "responder_unavailable")
 		return s.abort(ctx, claim, errors.New("responder unavailable"))
 	}
+	if len(claim.Incoming.Images) > 0 {
+		if s.MediaDescriber == nil {
+			observability.Start(ctx, claim.Incoming.UpdateID, "media_description").Fail(ctx, "describer_unavailable")
+			return s.abort(ctx, claim, errors.New("media describer unavailable"))
+		}
+		descriptionStage := observability.Start(ctx, claim.Incoming.UpdateID, "media_description")
+		description, err := s.MediaDescriber.Describe(ctx, claim.Incoming.UpdateID, claim.Incoming.Images)
+		if err != nil {
+			descriptionStage.Outcome(ctx, "failed", "code", "media_description_failed")
+			return s.abort(ctx, claim, errors.Join(errors.New("describe incoming media failed"), err))
+		}
+		transcript, err := appendMediaDescription(claim.Incoming.Text, description)
+		if err != nil {
+			descriptionStage.Fail(ctx, "media_description_too_large")
+			return s.abort(ctx, claim, err)
+		}
+		if err := s.Store.UpdateUserMessage(ctx, claim, transcript); err != nil {
+			descriptionStage.Fail(ctx, "archive_media_description_failed")
+			return s.abort(ctx, claim, errors.Join(errors.New("save media description failed"), err))
+		}
+		descriptionStage.Complete(ctx, "image_count", len(claim.Incoming.Images), "description_runes", len([]rune(description)))
+	} else if claim.Incoming.MediaUnavailable {
+		transcript := strings.TrimSpace(claim.Incoming.Text) + "\n\n[Вложение не удалось загрузить или разобрать.]"
+		if err := s.Store.UpdateUserMessage(ctx, claim, transcript); err != nil {
+			observability.Start(ctx, claim.Incoming.UpdateID, "media_description").Fail(ctx, "archive_media_error_failed")
+			return s.abort(ctx, claim, errors.Join(errors.New("save media error failed"), err))
+		}
+	}
 
 	modelContextStage := observability.Start(ctx, claim.Incoming.UpdateID, "model_context_load")
 	modelContext, err := s.Store.ModelContext(ctx, claim)
@@ -171,7 +210,13 @@ func (s Service) processClaim(ctx context.Context, claim Claim) error {
 	}
 	historyStage.Complete(ctx, "message_count", len(history))
 	responseStage := observability.Start(ctx, claim.Incoming.UpdateID, "response_generation")
-	result, err := s.Responder.Respond(ctx, domain.AgentRequest{
+	responseContext := ctx
+	var cancelResponse context.CancelFunc
+	if len(claim.Incoming.Images) > 0 {
+		responseContext, cancelResponse = context.WithTimeout(ctx, MediaResponseTimeout)
+		defer cancelResponse()
+	}
+	result, err := s.Responder.Respond(responseContext, domain.AgentRequest{
 		UpdateID:     claim.Incoming.UpdateID,
 		Instructions: s.SystemPrompt,
 		Context:      modelContext,
@@ -204,6 +249,18 @@ func (s Service) processClaim(ctx context.Context, claim Claim) error {
 	}
 	commitStage.Complete(ctx, "response_runes", len([]rune(response)), "model_context_bytes", len(modelContext.ItemsJSON))
 	return s.deliver(ctx, claim.Incoming.UpdateID)
+}
+
+func appendMediaDescription(message string, description string) (string, error) {
+	description = strings.TrimSpace(description)
+	if description == "" || !utf8.ValidString(description) || strings.ContainsRune(description, '\x00') {
+		return "", errors.New("invalid media description")
+	}
+	result := strings.TrimSpace(message) + "\n\n[Описание изображения: " + description + "]"
+	if len(result) > MaxConversationTextBytes {
+		return "", ErrInputTooLarge
+	}
+	return result, nil
 }
 
 func (s Service) deliver(ctx context.Context, updateID int64) error {

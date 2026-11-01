@@ -38,6 +38,20 @@ func TestSQLiteStoreWithRealDriver(t *testing.T) {
 		t.Fatalf("re-run existing SQLite migrations: %v", err)
 	}
 
+	mediaInput := sampleIncoming(90, 2, domain.MessageText, "Что на фото?")
+	mediaClaim := beginClaimed(t, ctx, store, mediaInput)
+	mediaTranscript := "Что на фото?\n\n[Описание изображения: чёрная кошка]"
+	if err := store.UpdateUserMessage(ctx, mediaClaim, mediaTranscript); err != nil {
+		t.Fatalf("replace archived media input with text description: %v", err)
+	}
+	mediaHistory, err := store.History(ctx, mediaClaim, 0)
+	if err != nil || len(mediaHistory) != 1 || mediaHistory[0].Text != mediaTranscript {
+		t.Fatalf("archived media transcript = (%#v, %v), want text description", mediaHistory, err)
+	}
+	if err := store.Release(ctx, mediaClaim); err != nil {
+		t.Fatalf("release media-description test claim: %v", err)
+	}
+
 	first := sampleIncoming(100, 1, domain.MessageText, "first")
 	claim := beginClaimed(t, ctx, store, first)
 	if history, err := store.History(ctx, claim, -1); err != nil || len(history) != 1 || history[0].Text != first.Text || history[0].Role != domain.RoleUser {

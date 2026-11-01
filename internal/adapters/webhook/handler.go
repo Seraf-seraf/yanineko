@@ -20,6 +20,7 @@ const RequestTimeout = 48 * time.Second
 type Handler struct {
 	Config      config.Config
 	BotUsername func(context.Context) (string, error)
+	LoadMedia   func(context.Context, telegram.Update) ([]domain.Image, error)
 	Process     func(context.Context, domain.Incoming) error
 }
 
@@ -84,6 +85,22 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	classification.Complete(ctx, append(classificationFields, "message_kind", incoming.Kind)...)
+	if h.LoadMedia != nil {
+		mediaStage := observability.Start(ctx, update.ID, "telegram_media")
+		images, mediaErr := h.LoadMedia(ctx, update)
+		if mediaErr != nil {
+			if errors.Is(mediaErr, context.Canceled) || errors.Is(mediaErr, context.DeadlineExceeded) {
+				mediaStage.Fail(ctx, "media_load_cancelled")
+				http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			mediaStage.Outcome(ctx, "unavailable", "code", "media_load_failed")
+			incoming.MediaUnavailable = true
+		} else {
+			mediaStage.Complete(ctx, "frame_count", len(images))
+			incoming.Images = images
+		}
+	}
 	if h.Process == nil {
 		observability.Start(ctx, update.ID, "update_processing").Fail(ctx, "processor_unavailable")
 		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)

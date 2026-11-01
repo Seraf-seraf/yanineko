@@ -15,11 +15,19 @@ const (
 )
 
 type Incoming struct {
-	UpdateID  int64
-	Key       ConversationKey
-	MessageID int64
-	Text      string
-	Kind      MessageKind
+	UpdateID         int64
+	Key              ConversationKey
+	MessageID        int64
+	Text             string
+	Kind             MessageKind
+	Images           []Image
+	MediaUnavailable bool
+}
+
+// Image is transient media prepared for visual description. It is never stored.
+type Image struct {
+	Data     []byte
+	MIMEType string
 }
 
 type Role string

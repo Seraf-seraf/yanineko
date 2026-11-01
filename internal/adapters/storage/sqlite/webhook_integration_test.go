@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,10 +46,11 @@ func TestWebhookToSQLiteServiceEndToEnd(t *testing.T) {
 	messenger := &integrationMessenger{}
 	botUsernameCalls := 0
 	service := app.Service{
-		SystemPrompt: "test character prompt",
-		Store:        store,
-		Responder:    responder,
-		Messenger:    messenger,
+		SystemPrompt:   "test character prompt",
+		Store:          store,
+		Responder:      responder,
+		MediaDescriber: integrationMediaDescriber{},
+		Messenger:      messenger,
 	}
 	handler := webhook.Handler{
 		Config: config.Config{
@@ -58,6 +60,12 @@ func TestWebhookToSQLiteServiceEndToEnd(t *testing.T) {
 		BotUsername: func(context.Context) (string, error) {
 			botUsernameCalls++
 			return "YaniNeko", nil
+		},
+		LoadMedia: func(_ context.Context, update telegram.Update) ([]domain.Image, error) {
+			if update.Message != nil && len(update.Message.Photo) > 0 {
+				return []domain.Image{{Data: []byte("transient-image-marker"), MIMEType: "image/png"}}, nil
+			}
+			return nil, nil
 		},
 		Process: func(ctx context.Context, incoming domain.Incoming) error {
 			return service.Handle(ctx, incoming)
@@ -176,6 +184,29 @@ func TestWebhookToSQLiteServiceEndToEnd(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM conversation_messages WHERE chat_id = 101 AND thread_id = 0`).Scan(&archiveCount); err != nil || archiveCount != 4 {
 		t.Fatalf("same-chat archived messages = (%d, %v), want both full turns retained", archiveCount, err)
 	}
+
+	mediaUpdate := integrationUpdate{UpdateID: 106, Message: telegram.Message{
+		ID: 7, Chat: telegram.Chat{ID: 203, Type: "private"}, From: &telegram.User{ID: 707},
+		Caption: "Что изображено?", Photo: []telegram.PhotoSize{{FileID: "test-photo", Width: 100, Height: 100}},
+	}}
+	if response := serveIntegrationUpdate(t, handler, integrationWebhookSecret, mediaUpdate); response.Code != http.StatusOK {
+		t.Fatalf("media update status = %d, want 200", response.Code)
+	}
+	mediaHistory := responder.calls[len(responder.calls)-1].history
+	wantDescription := "Что изображено?\n\n[Описание изображения: На изображении чёрная кошка.]"
+	if len(mediaHistory) != 1 || mediaHistory[0].Text != wantDescription {
+		t.Fatalf("media model history = %#v, want textual visual description", mediaHistory)
+	}
+	var storedInput, archivedText string
+	if err := db.QueryRowContext(ctx, `SELECT input_text FROM processed_updates WHERE update_id = 106`).Scan(&storedInput); err != nil || storedInput != mediaUpdate.Message.Caption {
+		t.Fatalf("idempotency input = (%q, %v), want original caption", storedInput, err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT content FROM conversation_messages WHERE update_id = 106 AND role = 'user'`).Scan(&archivedText); err != nil || archivedText != wantDescription {
+		t.Fatalf("archived user input = (%q, %v), want image description", archivedText, err)
+	}
+	if strings.Contains(archivedText, "transient-image-marker") {
+		t.Fatal("archived user input contains image bytes")
+	}
 }
 
 type integrationUpdate struct {
@@ -190,6 +221,12 @@ type integrationResponseCall struct {
 
 type integrationResponder struct {
 	calls []integrationResponseCall
+}
+
+type integrationMediaDescriber struct{}
+
+func (integrationMediaDescriber) Describe(_ context.Context, _ int64, _ []domain.Image) (string, error) {
+	return "На изображении чёрная кошка.", nil
 }
 
 func (r *integrationResponder) Respond(ctx context.Context, request domain.AgentRequest, _ domain.AgentMemory) (domain.AgentResult, error) {

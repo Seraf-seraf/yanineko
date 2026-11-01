@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"path"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -17,14 +18,20 @@ type Update struct {
 }
 
 type Message struct {
-	ID             int64           `json:"message_id"`
-	Chat           Chat            `json:"chat"`
-	From           *User           `json:"from"`
-	SenderChat     *Chat           `json:"sender_chat"`
-	Text           string          `json:"text"`
-	ThreadID       int64           `json:"message_thread_id"`
-	Entities       []Entity        `json:"entities"`
-	ReplyToMessage *ReplyToMessage `json:"reply_to_message"`
+	ID              int64       `json:"message_id"`
+	Chat            Chat        `json:"chat"`
+	From            *User       `json:"from"`
+	SenderChat      *Chat       `json:"sender_chat"`
+	Text            string      `json:"text"`
+	Caption         string      `json:"caption"`
+	ThreadID        int64       `json:"message_thread_id"`
+	Entities        []Entity    `json:"entities"`
+	CaptionEntities []Entity    `json:"caption_entities"`
+	Photo           []PhotoSize `json:"photo"`
+	Animation       *MediaFile  `json:"animation"`
+	Document        *MediaFile  `json:"document"`
+	Sticker         *Sticker    `json:"sticker"`
+	ReplyToMessage  *Message    `json:"reply_to_message"`
 }
 
 type Chat struct {
@@ -43,9 +50,33 @@ type Entity struct {
 	Length int    `json:"length"`
 }
 
-type ReplyToMessage struct {
-	From *User `json:"from"`
+type PhotoSize struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	FileSize     int64  `json:"file_size"`
 }
+
+type MediaFile struct {
+	FileID       string     `json:"file_id"`
+	FileUniqueID string     `json:"file_unique_id"`
+	FileName     string     `json:"file_name"`
+	FileSize     int64      `json:"file_size"`
+	MIMEType     string     `json:"mime_type"`
+	Thumbnail    *PhotoSize `json:"thumbnail"`
+}
+
+type Sticker struct {
+	FileID       string     `json:"file_id"`
+	FileUniqueID string     `json:"file_unique_id"`
+	FileSize     int64      `json:"file_size"`
+	IsAnimated   bool       `json:"is_animated"`
+	IsVideo      bool       `json:"is_video"`
+	Thumbnail    *PhotoSize `json:"thumbnail"`
+}
+
+type ReplyToMessage = Message
 
 func ParseUpdate(reader io.Reader) (Update, bool, error) {
 	decoder := json.NewDecoder(reader)
@@ -100,7 +131,7 @@ func ParseUpdate(reader io.Reader) (Update, bool, error) {
 
 func NeedsBotUsername(update Update) bool {
 	message := update.Message
-	if message == nil || message.Text == "" || message.From == nil || message.From.IsBot || message.SenderChat != nil {
+	if message == nil || message.From == nil || message.From.IsBot || message.SenderChat != nil {
 		return false
 	}
 	_, commandTarget, hasCommand := parseCommand(message)
@@ -108,7 +139,7 @@ func NeedsBotUsername(update Update) bool {
 		return true
 	}
 	return (message.Chat.Type == "group" || message.Chat.Type == "supergroup") &&
-		(hasMentionEntity(message) || strings.ContainsRune(message.Text, '@'))
+		(hasMentionEntity(message) || strings.ContainsRune(message.Text, '@') || strings.ContainsRune(message.Caption, '@'))
 }
 
 func Classify(update Update, botID int64, botUsername string) (domain.Incoming, bool) {
@@ -124,8 +155,12 @@ func ClassifyWithReason(update Update, botID int64, botUsername string) (domain.
 	if message.From == nil || message.From.ID <= 0 || message.From.IsBot || message.SenderChat != nil {
 		return domain.Incoming{}, false, "ineligible_sender"
 	}
-	if strings.TrimSpace(message.Text) == "" {
+	text := messageText(message)
+	if strings.TrimSpace(text) == "" && !hasMedia(message) {
 		return domain.Incoming{}, false, "empty_text"
+	}
+	if strings.TrimSpace(text) == "" {
+		text = "Пользователь отправил изображение или анимацию."
 	}
 	private := message.Chat.Type == "private"
 	group := message.Chat.Type == "group" || message.Chat.Type == "supergroup"
@@ -160,12 +195,42 @@ func ClassifyWithReason(update Update, botID int64, botUsername string) (domain.
 }
 
 func incoming(update Update, message *Message, kind domain.MessageKind) domain.Incoming {
+	text := messageText(message)
+	if strings.TrimSpace(text) == "" && hasMedia(message) {
+		text = "Пользователь отправил изображение или анимацию."
+	}
 	return domain.Incoming{
 		UpdateID:  update.ID,
 		Key:       domain.ConversationKey{ChatID: message.Chat.ID, ThreadID: message.ThreadID},
 		MessageID: message.ID,
-		Text:      message.Text,
+		Text:      text,
 		Kind:      kind,
+	}
+}
+
+func messageText(message *Message) string {
+	if strings.TrimSpace(message.Text) != "" {
+		return message.Text
+	}
+	return message.Caption
+}
+
+func hasMedia(message *Message) bool {
+	return len(message.Photo) > 0 || message.Animation != nil || isImageDocument(message.Document) || message.Sticker != nil
+}
+
+func isImageDocument(document *MediaFile) bool {
+	if document == nil {
+		return false
+	}
+	if strings.HasPrefix(strings.ToLower(document.MIMEType), "image/") {
+		return true
+	}
+	switch strings.ToLower(path.Ext(document.FileName)) {
+	case ".png", ".jpg", ".jpeg", ".webp", ".gif":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -191,7 +256,7 @@ func parseCommand(message *Message) (string, string, bool) {
 }
 
 func hasMentionEntity(message *Message) bool {
-	for _, entity := range message.Entities {
+	for _, entity := range append(append([]Entity(nil), message.Entities...), message.CaptionEntities...) {
 		if entity.Type == "mention" {
 			return true
 		}
@@ -203,16 +268,20 @@ func hasMention(message *Message, botUsername string) bool {
 	if botUsername == "" {
 		return false
 	}
-	for _, entity := range message.Entities {
+	text, entities := message.Text, message.Entities
+	if text == "" {
+		text, entities = message.Caption, message.CaptionEntities
+	}
+	for _, entity := range entities {
 		if entity.Type != "mention" {
 			continue
 		}
-		value, ok := entityText(message.Text, entity.Offset, entity.Length)
+		value, ok := entityText(text, entity.Offset, entity.Length)
 		if ok && strings.HasPrefix(value, "@") && strings.EqualFold(value[1:], botUsername) {
 			return true
 		}
 	}
-	return hasTextMention(message.Text, botUsername)
+	return hasTextMention(text, botUsername)
 }
 
 func hasTextMention(text, botUsername string) bool {

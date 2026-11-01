@@ -85,6 +85,64 @@ func TestHandleTextPassesPromptAndHistoryAndPersistsResponse(t *testing.T) {
 	}
 }
 
+func TestHandleMediaStoresDescriptionAndPassesTextOnlyToResponder(t *testing.T) {
+	t.Parallel()
+
+	input := sampleIncoming(domain.MessageText, "Что на картинке?")
+	input.Images = []domain.Image{{Data: []byte("ephemeral png bytes"), MIMEType: "image/png"}}
+	store := newTestStore(input)
+	describer := &testMediaDescriber{description: "На изображении чёрная кошка рядом с красным мячом."}
+	responder := &testResponder{response: "Кошка присматривается к мячу."}
+	service := Service{
+		SystemPrompt:   "Ты Табакошка.",
+		Store:          store,
+		Responder:      responder,
+		MediaDescriber: describer,
+		Messenger:      &testMessenger{},
+	}
+
+	if err := service.Handle(context.Background(), input); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	wantUserText := "Что на картинке?\n\n[Описание изображения: На изображении чёрная кошка рядом с красным мячом.]"
+	if len(responder.request.Messages) != 1 || responder.request.Messages[0].Text != wantUserText {
+		t.Fatalf("responder history = %#v, want only described user text", responder.request.Messages)
+	}
+	if len(describer.images) != 1 || string(describer.images[0].Data) != "ephemeral png bytes" {
+		t.Fatalf("describer images = %#v, want transient image bytes", describer.images)
+	}
+	if len(responder.request.Context.ItemsJSON) != 2 || string(responder.request.Context.ItemsJSON) != "[]" {
+		t.Fatalf("responder model context = %s, want empty prior context", responder.request.Context.ItemsJSON)
+	}
+	if len(store.history) < 1 || store.history[0].Text != wantUserText {
+		t.Fatalf("archived history = %#v, want media description in user transcript", store.history)
+	}
+	if strings.Contains(string(store.committed.ItemsJSON), "ephemeral png bytes") {
+		t.Fatal("persisted model context contains media bytes")
+	}
+}
+
+func TestHandleMediaUnavailableArchivesNoticeWithoutChangingInputText(t *testing.T) {
+	t.Parallel()
+
+	input := sampleIncoming(domain.MessageText, "Что на фото?")
+	input.MediaUnavailable = true
+	store := newTestStore(input)
+	responder := &testResponder{response: "Не получилось рассмотреть вложение."}
+	service := Service{Store: store, Responder: responder, Messenger: &testMessenger{}}
+
+	if err := service.Handle(context.Background(), input); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	wantTranscript := "Что на фото?\n\n[Вложение не удалось загрузить или разобрать.]"
+	if len(responder.request.Messages) != 1 || responder.request.Messages[0].Text != wantTranscript {
+		t.Fatalf("responder history = %#v, want media failure notice", responder.request.Messages)
+	}
+	if len(store.history) != 1 || store.history[0].Text != wantTranscript {
+		t.Fatalf("archived history = %#v, want media failure notice", store.history)
+	}
+}
+
 func TestHandleTruncatesTelegramResponseBeforePersistence(t *testing.T) {
 	t.Parallel()
 
@@ -307,6 +365,17 @@ func (s *testStore) History(_ context.Context, claim Claim, afterMessageOrder in
 	return history, nil
 }
 
+func (s *testStore) UpdateUserMessage(_ context.Context, claim Claim, content string) error {
+	for index := range s.history {
+		message := &s.history[index]
+		if message.UpdateID == claim.Incoming.UpdateID && message.Role == domain.RoleUser {
+			message.Text = content
+			return nil
+		}
+	}
+	return errors.New("archived user message not found")
+}
+
 func (s *testStore) ModelContext(_ context.Context, claim Claim) (domain.ModelContext, error) {
 	s.claim = claim
 	return s.modelContext, nil
@@ -367,6 +436,17 @@ type testResponder struct {
 	request  domain.AgentRequest
 	response string
 	err      error
+}
+
+type testMediaDescriber struct {
+	description string
+	images      []domain.Image
+	err         error
+}
+
+func (d *testMediaDescriber) Describe(_ context.Context, _ int64, images []domain.Image) (string, error) {
+	d.images = images
+	return d.description, d.err
 }
 
 func (r *testResponder) Respond(_ context.Context, request domain.AgentRequest, _ domain.AgentMemory) (domain.AgentResult, error) {
