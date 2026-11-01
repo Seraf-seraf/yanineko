@@ -2,8 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/webhook.go": {
-      "maxDuration": 55,
-      "includeFiles": "third_party/ffmpeg/ffmpeg"
+      "maxDuration": 55
     }
   }
 }

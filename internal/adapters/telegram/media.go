@@ -20,11 +20,14 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Seraf-seraf/yanineko/internal/domain"
+	ffmpegasset "github.com/Seraf-seraf/yanineko/third_party/ffmpeg"
 	"github.com/xo/lottie"
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
@@ -42,6 +45,8 @@ const MaxFrameStreamBytes int64 = 8 << 20
 const MaxStickerVideoDuration = 3 * time.Second
 const MaxTGSAnimationDuration = 3100 * time.Millisecond
 const bundledFFmpegPath = "third_party/ffmpeg/ffmpeg"
+
+var ffmpegMaterializeMu sync.Mutex
 
 var (
 	ErrInvalidMedia            = errors.New("invalid Telegram media")
@@ -424,7 +429,11 @@ func mediaDecodeError(ctx context.Context) error {
 }
 
 func decodeVideoFrames(ctx context.Context, data []byte) ([][]byte, error) {
-	ffmpeg, err := findFFmpeg(ffmpegBundleRoots())
+	return decodeVideoFramesWithRoots(ctx, data, ffmpegBundleRoots())
+}
+
+func decodeVideoFramesWithRoots(ctx context.Context, data []byte, bundleRoots []string) ([][]byte, error) {
+	ffmpeg, err := findFFmpeg(bundleRoots)
 	if err != nil {
 		return nil, err
 	}
@@ -480,7 +489,51 @@ func findFFmpeg(bundleRoots []string) (string, error) {
 	if binary, err := exec.LookPath("ffmpeg"); err == nil {
 		return binary, nil
 	}
+	if binary, err := materializeBundledFFmpeg(); err == nil {
+		return binary, nil
+	}
 	return "", ErrMediaDecoderUnavailable
+}
+
+func materializeBundledFFmpeg() (string, error) {
+	const embeddedFFmpegName = "ffmpeg-9.0.2"
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		return "", ErrMediaDecoderUnavailable
+	}
+	ffmpegMaterializeMu.Lock()
+	defer ffmpegMaterializeMu.Unlock()
+	cacheDirectory := filepath.Join(os.TempDir(), "yanineko")
+	if err := os.MkdirAll(cacheDirectory, 0o700); err != nil {
+		return "", err
+	}
+	binary := filepath.Join(cacheDirectory, embeddedFFmpegName)
+	if info, err := os.Stat(binary); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+		return binary, nil
+	}
+	temporary, err := os.CreateTemp(cacheDirectory, ".ffmpeg-*")
+	if err != nil {
+		return "", err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if _, err := temporary.Write(ffmpegasset.Binary); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Chmod(0o700); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(temporaryName, binary); err != nil {
+		if info, statErr := os.Stat(binary); statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return binary, nil
+		}
+		return "", err
+	}
+	return binary, nil
 }
 
 func videoDecodeArgs() []string {

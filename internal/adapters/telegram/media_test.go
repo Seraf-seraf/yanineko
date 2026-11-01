@@ -132,10 +132,37 @@ func TestDecodeVideoFramesUsesBundledFFmpegForTelegramAnimations(t *testing.T) {
 	}
 }
 
-func TestFindFFmpegReportsMissingDecoder(t *testing.T) {
+func TestDecodeVideoFramesUsesEmbeddedFFmpegWhenBundleFileIsUnavailable(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("embedded FFmpeg targets Linux x86_64")
+	}
+	bundleRoot := t.TempDir()
+	temporaryRoot := t.TempDir()
+	t.Setenv("TMPDIR", temporaryRoot)
 	t.Setenv("PATH", t.TempDir())
-	if _, err := findFFmpeg(nil); !errors.Is(err, ErrMediaDecoderUnavailable) {
-		t.Fatalf("findFFmpeg() error = %v, want ErrMediaDecoderUnavailable", err)
+
+	data, err := os.ReadFile(filepath.Join("testdata", "tiny-vp9-sticker.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := decodeVideoFramesWithRoots(context.Background(), data, []string{bundleRoot})
+	if err != nil {
+		t.Fatalf("decodeVideoFramesWithRoots() error = %v", err)
+	}
+	if len(frames) != MaxVisionFrames {
+		t.Fatalf("decoded frames = %d, want %d", len(frames), MaxVisionFrames)
+	}
+
+	ffmpeg := filepath.Join(temporaryRoot, "yanineko", "ffmpeg-9.0.2")
+	info, err := os.Stat(ffmpeg)
+	if err != nil {
+		t.Fatalf("embedded FFmpeg stat error = %v", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("embedded FFmpeg mode = %v; want executable regular file", info.Mode())
+	}
+	if _, err := os.Stat(filepath.Join(bundleRoot, bundledFFmpegPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("bundle FFmpeg stat error = %v, want file absent", err)
 	}
 }
 
