@@ -52,15 +52,104 @@ func TestLoadMediaDownloadsAndNormalizesLargestPhoto(t *testing.T) {
 		{FileID: "small-photo", Width: 32, Height: 32},
 		{FileID: "large-photo", Width: 64, Height: 64},
 	}}}
-	images, err := client.LoadMedia(context.Background(), update)
+	media, err := client.LoadMedia(context.Background(), update)
 	if err != nil {
 		t.Fatalf("LoadMedia() error = %v", err)
 	}
-	if len(images) != 1 || images[0].MIMEType != "image/png" {
-		t.Fatalf("LoadMedia() = %#v, want normalized PNG", images)
+	if len(media.Images) != 1 || media.Images[0].MIMEType != "image/png" || media.Source != MediaSourceOriginal {
+		t.Fatalf("LoadMedia() = %#v, want original normalized PNG", media)
 	}
-	if _, format, err := image.Decode(bytes.NewReader(images[0].Data)); err != nil || format != "png" {
+	if _, format, err := image.Decode(bytes.NewReader(media.Images[0].Data)); err != nil || format != "png" {
 		t.Fatalf("normalized frame format = %q, %v, want PNG", format, err)
+	}
+}
+
+func TestLoadMediaExtractsEverySampledTelegramAnimationFrame(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("bundled FFmpeg targets Linux x86_64")
+	}
+	animation, err := os.ReadFile(filepath.Join("testdata", "tiny-h264-animation.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bot123:synthetic-token/getFile":
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"file_path":"animations/clip.mp4","file_size":` + strconv.Itoa(len(animation)) + `}}`))
+		case "/file/bot123:synthetic-token/animations/clip.mp4":
+			_, _ = w.Write(animation)
+		default:
+			t.Errorf("unexpected Telegram path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newClient("123:synthetic-token", 123, server.URL, server.Client())
+	update := Update{ID: 10, Message: &Message{ID: 11, Chat: Chat{ID: 12, Type: "private"}, Animation: &MediaFile{
+		FileID: "telegram-animation", FileSize: int64(len(animation)), MIMEType: "video/mp4",
+	}}}
+	media, err := client.LoadMedia(context.Background(), update)
+	if err != nil {
+		t.Fatalf("LoadMedia() error = %v", err)
+	}
+	if len(media.Images) != MaxVisionFrames || media.Source != MediaSourceOriginal {
+		t.Fatalf("LoadMedia() = %#v, want %d frames from original animation", media, MaxVisionFrames)
+	}
+	for index, frame := range media.Images {
+		if frame.MIMEType != "image/png" {
+			t.Errorf("frame %d MIMEType = %q, want image/png", index, frame.MIMEType)
+		}
+		if _, format, err := image.Decode(bytes.NewReader(frame.Data)); err != nil || format != "png" {
+			t.Errorf("frame %d format = %q, %v, want valid PNG", index, format, err)
+		}
+	}
+}
+
+func TestLoadMediaReportsThumbnailFallbackSource(t *testing.T) {
+	var thumbnail bytes.Buffer
+	if err := png.Encode(&thumbnail, image.NewRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bot123:synthetic-token/getFile":
+			var request struct {
+				FileID string `json:"file_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode getFile request: %v", err)
+			}
+			if request.FileID == "broken-animation" {
+				_, _ = w.Write([]byte(`{"ok":true,"result":{"file_path":"animations/broken.mp4","file_size":6}}`))
+			} else if request.FileID == "animation-thumbnail" {
+				_, _ = w.Write([]byte(`{"ok":true,"result":{"file_path":"photos/thumb.png","file_size":` + strconv.Itoa(thumbnail.Len()) + `}}`))
+			} else {
+				t.Errorf("unexpected Telegram file ID %q", request.FileID)
+				http.NotFound(w, r)
+			}
+		case "/file/bot123:synthetic-token/animations/broken.mp4":
+			_, _ = w.Write([]byte("broken"))
+		case "/file/bot123:synthetic-token/photos/thumb.png":
+			_, _ = w.Write(thumbnail.Bytes())
+		default:
+			t.Errorf("unexpected Telegram path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newClient("123:synthetic-token", 123, server.URL, server.Client())
+	update := Update{ID: 13, Message: &Message{ID: 14, Chat: Chat{ID: 15, Type: "private"}, Animation: &MediaFile{
+		FileID: "broken-animation", FileSize: 6, MIMEType: "video/mp4",
+		Thumbnail: &PhotoSize{FileID: "animation-thumbnail", FileSize: int64(thumbnail.Len())},
+	}}}
+	media, err := client.LoadMedia(context.Background(), update)
+	if err != nil {
+		t.Fatalf("LoadMedia() error = %v", err)
+	}
+	if len(media.Images) != 1 || media.Source != MediaSourceThumbnail {
+		t.Fatalf("LoadMedia() = %#v, want one fallback thumbnail", media)
 	}
 }
 
@@ -129,6 +218,50 @@ func TestDecodeVideoFramesUsesBundledFFmpegForTelegramAnimations(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDecodeVideoFramesSamplesShortAnimationAtMoreThanOneFrame(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("bundled FFmpeg targets Linux x86_64")
+	}
+	data, err := os.ReadFile(filepath.Join("testdata", "tiny-short-animation.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := decodeMediaFrames(context.Background(), "animation", data)
+	if err != nil {
+		t.Fatalf("decodeMediaFrames() error = %v", err)
+	}
+	if len(frames) != 2 {
+		t.Fatalf("decoded frames = %d, want 2 samples from 500ms animation", len(frames))
+	}
+}
+
+func TestEncodeImageFramesEvenlySamplesVideoCandidates(t *testing.T) {
+	candidates := make([]image.Image, MaxVideoSampleFrames)
+	for index := range candidates {
+		frame := image.NewRGBA(image.Rect(0, 0, 1, 1))
+		frame.SetRGBA(0, 0, color.RGBA{R: byte(index), A: 255})
+		candidates[index] = frame
+	}
+	frames, err := encodeImageFrames(candidates)
+	if err != nil {
+		t.Fatalf("encodeImageFrames() error = %v", err)
+	}
+	if len(frames) != MaxVisionFrames {
+		t.Fatalf("encoded frame count = %d, want %d", len(frames), MaxVisionFrames)
+	}
+	wantIndices := []byte{0, 3, 7, 11}
+	for index, frameData := range frames {
+		frame, _, err := image.Decode(bytes.NewReader(frameData))
+		if err != nil {
+			t.Fatalf("decode sampled frame %d: %v", index, err)
+		}
+		got := color.RGBAModel.Convert(frame.At(0, 0)).(color.RGBA).R
+		if got != wantIndices[index] {
+			t.Errorf("sampled frame %d red value = %d, want source candidate %d", index, got, wantIndices[index])
+		}
 	}
 }
 
@@ -282,6 +415,14 @@ func TestVideoDecodeArgsBoundInputDecoder(t *testing.T) {
 		}
 		if optionIndex < 0 || optionIndex+1 >= inputIndex || args[optionIndex+1] != expected.value {
 			t.Errorf("%s setting = %#v, want %q before input", expected.option, args, expected.value)
+		}
+	}
+	if !strings.Contains(strings.Join(args, " "), "fps=4,") {
+		t.Errorf("video filter = %#v, want 4fps candidate sampling", args)
+	}
+	for index, argument := range args {
+		if argument == "-frames:v" && (index+1 >= len(args) || args[index+1] != strconv.Itoa(MaxVideoSampleFrames)) {
+			t.Errorf("frame cap = %#v, want %d candidates", args, MaxVideoSampleFrames)
 		}
 	}
 }

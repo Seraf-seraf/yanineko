@@ -138,6 +138,45 @@ func TestDescribeSendsImageAsDataURLAndReturnsText(t *testing.T) {
 	}
 }
 
+func TestDescribeSendsAllAnimationFramesInOrder(t *testing.T) {
+	const animationFrames = 4
+	images := make([]domain.Image, animationFrames)
+	for index := range images {
+		images[index] = domain.Image{Data: []byte("frame-" + strconv.Itoa(index)), MIMEType: "image/png"}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Input []struct {
+				Content []map[string]string `json:"content"`
+			} `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode image description request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(request.Input) != 1 || len(request.Input[0].Content) != len(images)+1 {
+			t.Errorf("description content count = %d, want text plus %d frames", len(request.Input[0].Content), len(images))
+		} else {
+			for index, image := range images {
+				content := request.Input[0].Content[index+1]
+				encoded := base64.StdEncoding.EncodeToString(image.Data)
+				if content["type"] != "input_image" || content["image_url"] != "data:image/png;base64,"+encoded {
+					t.Errorf("content[%d] = %#v, want frame %d in original order", index+1, content, index)
+				}
+			}
+		}
+		writeResponse(w, `{"id":"resp_media","created_at":1,"model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Видеоряд содержит несколько кадров."}]}]}`)
+	}))
+	defer server.Close()
+
+	client := newClient("synthetic-openai-key", "model", server.URL, server.Client())
+	description, err := client.Describe(context.Background(), 24, images)
+	if err != nil || description != "Видеоряд содержит несколько кадров." {
+		t.Fatalf("Describe() = (%q, %v), want text description", description, err)
+	}
+}
+
 func TestDescribeRejectsIncompleteResponse(t *testing.T) {
 	server := newBasicResponseServer(t, `{"id":"resp_media","created_at":1,"model":"model","status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"частичное описание"}]}]}`, nil)
 	defer server.Close()

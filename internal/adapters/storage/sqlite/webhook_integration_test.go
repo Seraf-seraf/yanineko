@@ -61,11 +61,11 @@ func TestWebhookToSQLiteServiceEndToEnd(t *testing.T) {
 			botUsernameCalls++
 			return "YaniNeko", nil
 		},
-		LoadMedia: func(_ context.Context, update telegram.Update) ([]domain.Image, error) {
+		LoadMedia: func(_ context.Context, update telegram.Update) (telegram.MediaResult, error) {
 			if update.Message != nil && len(update.Message.Photo) > 0 {
-				return []domain.Image{{Data: []byte("transient-image-marker"), MIMEType: "image/png"}}, nil
+				return telegram.MediaResult{Images: []domain.Image{{Data: []byte("transient-image-marker"), MIMEType: "image/png"}}, Source: telegram.MediaSourceOriginal}, nil
 			}
-			return nil, nil
+			return telegram.MediaResult{}, nil
 		},
 		Process: func(ctx context.Context, incoming domain.Incoming) error {
 			return service.Handle(ctx, incoming)

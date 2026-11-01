@@ -225,8 +225,8 @@ func TestServeHTTPMarksMediaLoadFailureWithoutChangingUpdateText(t *testing.T) {
 	var incoming domain.Incoming
 	handler := Handler{
 		Config: testConfig(),
-		LoadMedia: func(context.Context, telegram.Update) ([]domain.Image, error) {
-			return nil, errors.New("private media fetch error")
+		LoadMedia: func(context.Context, telegram.Update) (telegram.MediaResult, error) {
+			return telegram.MediaResult{}, errors.New("private media fetch error")
 		},
 		Process: func(_ context.Context, got domain.Incoming) error {
 			incoming = got
@@ -240,6 +240,39 @@ func TestServeHTTPMarksMediaLoadFailureWithoutChangingUpdateText(t *testing.T) {
 	}
 	if incoming.Text != "Что на фото?" || !incoming.MediaUnavailable {
 		t.Fatalf("incoming = %#v, want unchanged caption and transient media failure flag", incoming)
+	}
+}
+
+func TestServeHTTPLogsMediaSourceWithoutLoggingMediaContent(t *testing.T) {
+	var logOutput bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	const body = `{"update_id":25,"message":{"message_id":13,"chat":{"id":42,"type":"private"},"from":{"id":7,"is_bot":false},"caption":"caption marker","photo":[{}]}}`
+	handler := Handler{
+		Config: testConfig(),
+		LoadMedia: func(context.Context, telegram.Update) (telegram.MediaResult, error) {
+			return telegram.MediaResult{
+				Images: []domain.Image{{Data: []byte("private-frame-marker"), MIMEType: "image/png"}},
+				Source: telegram.MediaSourceThumbnail,
+			}, nil
+		},
+		Process: func(context.Context, domain.Incoming) error { return nil },
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authenticatedRequest(body))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	logs := logOutput.String()
+	if !strings.Contains(logs, `"phase":"telegram_media"`) ||
+		!strings.Contains(logs, `"frame_count":1`) ||
+		!strings.Contains(logs, `"frame_source":"thumbnail"`) {
+		t.Fatalf("logs = %s, want media source and frame count", logs)
+	}
+	if strings.Contains(logs, "private-frame-marker") || strings.Contains(logs, "caption marker") {
+		t.Fatalf("logs contain private media content: %s", logs)
 	}
 }
 

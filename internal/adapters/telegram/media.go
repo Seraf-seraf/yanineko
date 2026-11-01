@@ -45,6 +45,13 @@ const MaxFrameStreamBytes int64 = 8 << 20
 const MaxStickerVideoDuration = 3 * time.Second
 const MaxTGSAnimationDuration = 3100 * time.Millisecond
 const bundledFFmpegPath = "third_party/ffmpeg/ffmpeg"
+const MaxVideoSampleFrames = 12
+
+const (
+	MediaSourceOriginal  = "original"
+	MediaSourceThumbnail = "thumbnail"
+	MediaSourceMixed     = "mixed"
+)
 
 var ffmpegMaterializeMu sync.Mutex
 
@@ -65,11 +72,16 @@ type mediaReference struct {
 	thumbnail *PhotoSize
 }
 
+type MediaResult struct {
+	Images []domain.Image
+	Source string
+}
+
 // LoadMedia fetches supported media from the current message and, when present,
 // the message it replies to. Downloaded bytes remain in memory only.
-func (c *Client) LoadMedia(ctx context.Context, update Update) ([]domain.Image, error) {
+func (c *Client) LoadMedia(ctx context.Context, update Update) (MediaResult, error) {
 	if c == nil || update.Message == nil {
-		return nil, ErrInvalidTelegramRequest
+		return MediaResult{}, ErrInvalidTelegramRequest
 	}
 	message := update.Message
 	refs := mediaReferences(message)
@@ -77,35 +89,44 @@ func (c *Client) LoadMedia(ctx context.Context, update Update) ([]domain.Image, 
 		refs = mediaReferences(message.ReplyToMessage)
 	}
 	if len(refs) == 0 {
-		return nil, nil
+		return MediaResult{}, nil
 	}
 	if len(refs) > 2 {
 		refs = refs[:2]
 	}
-	images := make([]domain.Image, 0, MaxVisionFrames)
+	result := MediaResult{Images: make([]domain.Image, 0, MaxVisionFrames)}
 	for _, ref := range refs {
 		data, err := c.downloadFile(ctx, ref.fileID, ref.fileSize)
 		if err != nil {
-			return nil, err
+			return MediaResult{}, err
 		}
+		source := MediaSourceOriginal
 		frames, err := decodeMediaFrames(ctx, ref.kind, data)
 		if err != nil && ref.thumbnail != nil {
 			thumb, thumbErr := c.downloadFile(ctx, ref.thumbnail.FileID, ref.thumbnail.FileSize)
 			if thumbErr == nil {
 				frames, err = decodeMediaFrames(ctx, "image", thumb)
+				if err == nil {
+					source = MediaSourceThumbnail
+				}
 			}
 		}
 		if err != nil {
-			return nil, err
+			return MediaResult{}, err
+		}
+		if result.Source == "" {
+			result.Source = source
+		} else if result.Source != source {
+			result.Source = MediaSourceMixed
 		}
 		for _, frame := range frames {
-			images = append(images, domain.Image{Data: frame, MIMEType: "image/png"})
-			if len(images) == MaxVisionFrames {
-				return images, nil
+			result.Images = append(result.Images, domain.Image{Data: frame, MIMEType: "image/png"})
+			if len(result.Images) == MaxVisionFrames {
+				return result, nil
 			}
 		}
 	}
-	return images, nil
+	return result, nil
 }
 
 func mediaReferences(message *Message) []mediaReference {
@@ -450,7 +471,7 @@ func decodeVideoFramesWithRoots(ctx context.Context, data []byte, bundleRoots []
 		return nil, ErrInvalidMedia
 	}
 	parts := splitJPEGFrames(output.data)
-	if len(parts) == 0 || len(parts) > MaxVisionFrames {
+	if len(parts) == 0 || len(parts) > MaxVideoSampleFrames {
 		return nil, ErrInvalidMedia
 	}
 	frames := make([]image.Image, 0, len(parts))
@@ -544,8 +565,8 @@ func videoDecodeArgs() []string {
 		"-threads", "0",
 		"-t", strconv.FormatFloat(MaxStickerVideoDuration.Seconds(), 'f', -1, 64),
 		"-i", "pipe:0",
-		"-vf", "fps=1.333,scale='min(512,iw)':'min(512,ih)':force_original_aspect_ratio=decrease",
-		"-frames:v", strconv.Itoa(MaxVisionFrames),
+		"-vf", "fps=4,scale='min(512,iw)':'min(512,ih)':force_original_aspect_ratio=decrease",
+		"-frames:v", strconv.Itoa(MaxVideoSampleFrames),
 		"-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
 	}
 }
@@ -564,7 +585,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 }
 
 func splitJPEGFrames(data []byte) [][]byte {
-	frames := make([][]byte, 0, MaxVisionFrames)
+	frames := make([][]byte, 0, MaxVideoSampleFrames)
 	start := -1
 	for i := 0; i+1 < len(data); i++ {
 		if data[i] == 0xff && data[i+1] == 0xd8 {
@@ -575,7 +596,7 @@ func splitJPEGFrames(data []byte) [][]byte {
 		if start >= 0 && data[i] == 0xff && data[i+1] == 0xd9 {
 			frames = append(frames, data[start:i+2])
 			start = -1
-			if len(frames) == MaxVisionFrames {
+			if len(frames) == MaxVideoSampleFrames {
 				break
 			}
 			i++
