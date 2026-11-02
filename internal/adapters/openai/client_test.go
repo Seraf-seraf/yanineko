@@ -54,7 +54,7 @@ func TestRespondUsesResponsesAPIAndReturnsOpaqueState(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			if request.Model != "gpt-6-luna" || request.Instructions != "Характер персонажа\nСтиль ответа" {
+			if request.Model != "gpt-6-luna" || request.Instructions != "Характер персонажа\nСтиль ответа\n\n"+authorInstructions {
 				t.Errorf("model/instructions = %q/%q", request.Model, request.Instructions)
 			}
 			if len(request.Input) != 2 {
@@ -100,6 +100,65 @@ func TestRespondUsesResponsesAPIAndReturnsOpaqueState(t *testing.T) {
 	}
 	if !json.Valid(got.ItemsJSON) || got.ItemsJSON[0] != '[' {
 		t.Fatalf("Respond().ItemsJSON = %s, want JSON array", got.ItemsJSON)
+	}
+}
+
+func TestRespondSendsNamesWithoutTelegramIDs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/responses/input_tokens") {
+			writeTokenCount(w, 100)
+			return
+		}
+		if !strings.HasSuffix(r.URL.Path, "/responses") {
+			http.NotFound(w, r)
+			return
+		}
+		var request struct {
+			Input []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"input"`
+			Instructions string `json:"instructions"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		if len(request.Input) != 2 {
+			t.Errorf("input count = %d", len(request.Input))
+			return
+		}
+		for i, want := range []struct{ participant, name, username string }{{"участник A", "Анна", "@first_name"}, {"участник B", "Анна", ""}} {
+			var content struct {
+				Participant string `json:"participant"`
+				Name        string `json:"name"`
+				Username    string `json:"username"`
+				Text        string `json:"text"`
+			}
+			if err := json.Unmarshal([]byte(request.Input[i].Content), &content); err != nil {
+				t.Error(err)
+				continue
+			}
+			if content.Participant != want.participant || content.Name != want.name || content.Username != want.username {
+				t.Errorf("author = %#v, want %#v", content, want)
+			}
+			if strings.Contains(request.Input[i].Content, "987654321987") {
+				t.Error("Telegram ID was sent to model")
+			}
+		}
+		if !strings.Contains(request.Instructions, "Текущий собеседник") {
+			t.Error("current sender instruction missing")
+		}
+		writeResponse(w, `{"id":"resp_1","created_at":1,"model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Привет"}]}]}`)
+	}))
+	defer server.Close()
+	client := newClient("synthetic-openai-key", "model", server.URL, server.Client())
+	_, err := client.Respond(context.Background(), domain.AgentRequest{Instructions: "Персонаж", Messages: []domain.Message{
+		{Role: domain.RoleUser, Text: "Привет", Author: &domain.Author{ID: 987654321987, Username: "first_name", Name: "Анна", Order: 1}},
+		{Role: domain.RoleUser, Text: "Я тоже", Author: &domain.Author{ID: 987654321988, Name: "Анна", Order: 2}},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -421,7 +480,7 @@ func TestRespondCompactsBeforeCrossingContextPriceThreshold(t *testing.T) {
 			}
 		case strings.HasSuffix(r.URL.Path, "/responses/compact"):
 			compactCalls.Add(1)
-			writeResponse(w, `{"id":"compact_1","created_at":1,"object":"response.compaction","output":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"compaction","encrypted_content":"opaque compacted state"}],"usage":{"input_tokens":200000,"output_tokens":100,"total_tokens":200100}}`)
+			writeResponse(w, `{"id":"compact_1","created_at":1,"object":"response.compaction","output":[{"type":"message","role":"user","content":[{"type":"input_text","text":"{\"participant\":\"A\",\"name\":\"Анна\",\"username\":\"@alice\",\"text\":\"hello\"}"}]},{"type":"compaction","encrypted_content":"opaque compacted state"}],"usage":{"input_tokens":200000,"output_tokens":100,"total_tokens":200100}}`)
 		case strings.HasSuffix(r.URL.Path, "/responses"):
 			var request struct {
 				Input []map[string]any `json:"input"`
@@ -441,6 +500,10 @@ func TestRespondCompactsBeforeCrossingContextPriceThreshold(t *testing.T) {
 			if len(request.Input) != 2 || request.Input[0]["type"] != "message" || request.Input[0]["role"] != "user" {
 				t.Errorf("next response input pruned retained message from compaction: %#v", request.Input)
 			}
+			encoded, err := json.Marshal(request.Input)
+			if err != nil || !strings.Contains(string(encoded), "@alice") || !strings.Contains(string(encoded), "Анна") {
+				t.Errorf("compaction lost retained author metadata: %s, %v", encoded, err)
+			}
 			writeResponse(w, `{"id":"resp_1","created_at":2,"model":"model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ответ"}]}]}`)
 		default:
 			t.Errorf("unexpected request path %s", r.URL.Path)
@@ -450,7 +513,9 @@ func TestRespondCompactsBeforeCrossingContextPriceThreshold(t *testing.T) {
 	defer server.Close()
 
 	client := newClient("synthetic-openai-key", "model", server.URL, server.Client())
-	if _, err := client.Respond(context.Background(), requestWithUserMessage(), nil); err != nil {
+	request := requestWithUserMessage()
+	request.Messages[0].Author = &domain.Author{ID: 9876543210, Username: "alice", Name: "Анна", Order: 1}
+	if _, err := client.Respond(context.Background(), request, nil); err != nil {
 		t.Fatalf("Respond() error = %v", err)
 	}
 	if countCalls.Load() != 3 || compactCalls.Load() != 1 {
