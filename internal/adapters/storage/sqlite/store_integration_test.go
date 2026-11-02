@@ -220,6 +220,60 @@ func TestSQLiteStoreWithRealDriver(t *testing.T) {
 	}
 }
 
+func TestSQLiteAuthorIdentityAndUsernameChanges(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("turso", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	store := newStore(db)
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first := sampleIncoming(2000, -200, domain.MessageText, "привет")
+	first.Author = &domain.Author{ID: 1234567890123, Username: "first_name", Name: "Анна"}
+	commitTurn(t, ctx, store, first, "привет")
+	second := sampleIncoming(2001, -200, domain.MessageText, "я тоже")
+	second.Author = &domain.Author{ID: 1234567890124, Name: "Анна"}
+	commitTurn(t, ctx, store, second, "вижу")
+	third := sampleIncoming(2002, -200, domain.MessageText, "новый ник")
+	third.Author = &domain.Author{ID: first.Author.ID, Username: "new_name", Name: "Анна"}
+	commitTurn(t, ctx, store, third, "поняла")
+	fourth := sampleIncoming(2003, -200, domain.MessageText, "без ника")
+	fourth.Author = &domain.Author{ID: first.Author.ID, Name: "Анна"}
+	claim := beginClaimed(t, ctx, newStore(db), fourth)
+	history, err := store.History(ctx, claim, 0)
+	if err != nil || len(history) != 7 {
+		t.Fatalf("history = %#v, error %v", history, err)
+	}
+	for _, item := range []struct {
+		index    int
+		id       int64
+		username string
+		order    int64
+	}{
+		{0, first.Author.ID, "first_name", 1}, {2, second.Author.ID, "", 2}, {4, third.Author.ID, "new_name", 1}, {6, fourth.Author.ID, "", 1},
+	} {
+		got := history[item.index].Author
+		if got == nil || got.ID != item.id || got.Username != item.username || got.Name != "Анна" || got.Order != item.order {
+			t.Errorf("history[%d].Author = %#v", item.index, got)
+		}
+	}
+	var username sql.NullString
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT username FROM telegram_users WHERE user_id = ?`, first.Author.ID).Scan(&username); err != nil || username.Valid {
+		t.Fatalf("cleared username = %#v, %v", username, err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM telegram_users`).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("user count = %d, %v", count, err)
+	}
+	if err := store.Release(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func testConcurrentSQLiteUpdates(t *testing.T, ctx context.Context, store *Store) {
 	t.Helper()
 	inputs := []domain.Incoming{

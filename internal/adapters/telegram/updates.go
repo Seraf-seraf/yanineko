@@ -40,8 +40,11 @@ type Chat struct {
 }
 
 type User struct {
-	ID    int64 `json:"id"`
-	IsBot bool  `json:"is_bot"`
+	ID        int64  `json:"id"`
+	IsBot     bool   `json:"is_bot"`
+	Username  string `json:"username"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
 }
 
 type Entity struct {
@@ -205,6 +208,7 @@ func incoming(update Update, message *Message, kind domain.MessageKind) domain.I
 		MessageID: message.ID,
 		Text:      text,
 		Kind:      kind,
+		Author:    &domain.Author{ID: message.From.ID, Username: message.From.Username, Name: strings.TrimSpace(message.From.FirstName + " " + message.From.LastName)},
 	}
 }
 

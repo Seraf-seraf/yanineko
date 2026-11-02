@@ -63,6 +63,10 @@ type updateRecord struct {
 	TelegramMessageID  pgtype.Int8
 	DeliveryOwner      pgtype.Text
 	DeliveryLeaseUntil pgtype.Timestamptz
+	AuthorID           pgtype.Int8
+	AuthorUsername     pgtype.Text
+	AuthorName         pgtype.Text
+	AuthorOrder        pgtype.Int8
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
@@ -120,7 +124,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`); err != nil {
 		return databaseError(ctx, err, ErrSchemaMigration)
 	}
-	for version, name := range []string{"migrations/001_initial.sql", "migrations/002_model_contexts.sql", "migrations/003_archive_order.sql"} {
+	for version, name := range []string{"migrations/001_initial.sql", "migrations/002_model_contexts.sql", "migrations/003_archive_order.sql", "migrations/004_authors.sql"} {
 		migrationVersion := version + 1
 		var applied bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM yanineko_schema_migrations WHERE version = $1)`, migrationVersion).Scan(&applied); err != nil {
@@ -234,21 +238,41 @@ func (s *Store) Begin(ctx context.Context, incoming domain.Incoming, leaseDurati
 	if err := setConversationLease(ctx, tx, incoming.Key, version, owner, leaseDuration); err != nil {
 		return app.BeginResult{}, err
 	}
+	if incoming.Author != nil {
+		author := *incoming.Author
+		if _, err := tx.Exec(ctx, `INSERT INTO conversation_members (chat_id, thread_id, user_id, member_order)
+			VALUES ($1, $2, $3, (SELECT COALESCE(MAX(member_order), 0) + 1 FROM conversation_members WHERE chat_id = $1 AND thread_id = $2))
+			ON CONFLICT (chat_id, thread_id, user_id) DO NOTHING`, incoming.Key.ChatID, incoming.Key.ThreadID, author.ID); err != nil {
+			return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
+		}
+		if err := tx.QueryRow(ctx, `SELECT member_order FROM conversation_members WHERE chat_id = $1 AND thread_id = $2 AND user_id = $3`, incoming.Key.ChatID, incoming.Key.ThreadID, author.ID).Scan(&author.Order); err != nil {
+			return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
+		}
+		incoming.Author = &author
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO processed_updates (
 			update_id, chat_id, thread_id, source_message_id, input_text, kind, state,
-			processing_owner, processing_version
-		) VALUES ($1, $2, $3, $4, $5, $6, 'processing', $7, $8)`,
+			processing_owner, processing_version, author_id, author_username, author_name, author_order
+		) VALUES ($1, $2, $3, $4, $5, $6, 'processing', $7, $8, $9, $10, $11, $12)`,
 		incoming.UpdateID, incoming.Key.ChatID, incoming.Key.ThreadID, incoming.MessageID,
-		incoming.Text, kindName(incoming.Kind), owner, version); err != nil {
+		incoming.Text, kindName(incoming.Kind), owner, version, authorID(incoming.Author), authorUsername(incoming.Author), authorName(incoming.Author), authorOrder(incoming.Author)); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return app.BeginResult{}, ErrUpdateConflict
 		}
 		return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
 	}
+	if incoming.Author != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO telegram_users (user_id, username, name, last_update_id)
+			VALUES ($1, $2, $3, $4) ON CONFLICT (user_id) DO UPDATE SET username = excluded.username, name = excluded.name,
+			last_update_id = excluded.last_update_id WHERE excluded.last_update_id > telegram_users.last_update_id`,
+			incoming.Author.ID, authorUsername(incoming.Author), incoming.Author.Name, incoming.UpdateID); err != nil {
+			return app.BeginResult{}, databaseError(ctx, err, ErrDatabaseOperation)
+		}
+	}
 	if incoming.Kind == domain.MessageText {
-		if err := insertArchivedUserMessage(ctx, tx, incoming.Key, incoming.UpdateID, incoming.Text); err != nil {
+		if err := insertArchivedUserMessage(ctx, tx, incoming.Key, incoming.UpdateID, incoming.Text, incoming.Author); err != nil {
 			return app.BeginResult{}, err
 		}
 	}
@@ -279,7 +303,7 @@ func (s *Store) History(ctx context.Context, claim app.Claim, afterUpdateID int6
 		return nil, ErrLeaseLost
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT update_id, archive_order, role, content
+		SELECT update_id, archive_order, role, content, author_id, author_username, author_name, author_order
 		FROM conversation_messages
 		WHERE chat_id = $1 AND thread_id = $2 AND archive_order > $3
 		ORDER BY archive_order`,
@@ -291,8 +315,15 @@ func (s *Store) History(ctx context.Context, claim app.Claim, afterUpdateID int6
 	history := make([]domain.Message, 0)
 	for rows.Next() {
 		var message domain.Message
-		if err := rows.Scan(&message.UpdateID, &message.ArchiveOrder, &message.Role, &message.Text); err != nil {
+		var id pgtype.Int8
+		var username pgtype.Text
+		var name pgtype.Text
+		var order pgtype.Int8
+		if err := rows.Scan(&message.UpdateID, &message.ArchiveOrder, &message.Role, &message.Text, &id, &username, &name, &order); err != nil {
 			return nil, databaseError(ctx, err, ErrDatabaseOperation)
+		}
+		if id.Valid {
+			message.Author = &domain.Author{ID: id.Int64, Username: username.String, Name: name.String, Order: order.Int64}
 		}
 		history = append(history, message)
 	}
@@ -730,7 +761,7 @@ func (s *Store) beginExisting(ctx context.Context, tx pgx.Tx, conversation conve
 	switch update.State {
 	case "processing":
 		if update.Kind == "text" {
-			if err := insertArchivedUserMessage(ctx, tx, domain.ConversationKey{ChatID: update.ChatID, ThreadID: update.ThreadID}, update.UpdateID, update.InputText); err != nil {
+			if err := insertArchivedUserMessage(ctx, tx, domain.ConversationKey{ChatID: update.ChatID, ThreadID: update.ThreadID}, update.UpdateID, update.InputText, incomingFromRecord(update).Author); err != nil {
 				return app.BeginResult{}, err
 			}
 		}
@@ -776,7 +807,7 @@ func (s *Store) beginEarlierPending(ctx context.Context, tx pgx.Tx, conversation
 	switch update.State {
 	case "processing":
 		if update.Kind == "text" {
-			if err := insertArchivedUserMessage(ctx, tx, domain.ConversationKey{ChatID: update.ChatID, ThreadID: update.ThreadID}, update.UpdateID, update.InputText); err != nil {
+			if err := insertArchivedUserMessage(ctx, tx, domain.ConversationKey{ChatID: update.ChatID, ThreadID: update.ThreadID}, update.UpdateID, update.InputText, incomingFromRecord(update).Author); err != nil {
 				return app.BeginResult{}, false, err
 			}
 		}
@@ -823,12 +854,12 @@ func (s *Store) beginEarlierPending(ctx context.Context, tx pgx.Tx, conversation
 	}
 }
 
-func insertArchivedUserMessage(ctx context.Context, tx pgx.Tx, key domain.ConversationKey, updateID int64, text string) error {
+func insertArchivedUserMessage(ctx context.Context, tx pgx.Tx, key domain.ConversationKey, updateID int64, text string, author *domain.Author) error {
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO conversation_messages (chat_id, thread_id, update_id, archive_order, role, content)
-		VALUES ($1, $2, $3, (SELECT COALESCE(MAX(archive_order), 0) + 1 FROM conversation_messages WHERE chat_id = $1 AND thread_id = $2), 'user', $4)
+		INSERT INTO conversation_messages (chat_id, thread_id, update_id, archive_order, role, content, author_id, author_username, author_name, author_order)
+		VALUES ($1, $2, $3, (SELECT COALESCE(MAX(archive_order), 0) + 1 FROM conversation_messages WHERE chat_id = $1 AND thread_id = $2), 'user', $4, $5, $6, $7, $8)
 		ON CONFLICT (chat_id, thread_id, update_id, role) DO NOTHING`,
-		key.ChatID, key.ThreadID, updateID, text); err != nil {
+		key.ChatID, key.ThreadID, updateID, text, authorID(author), authorUsername(author), authorName(author), authorOrder(author)); err != nil {
 		return databaseError(ctx, err, ErrDatabaseOperation)
 	}
 	return nil
@@ -870,14 +901,14 @@ func lockUpdate(ctx context.Context, tx pgx.Tx, updateID int64) (updateRecord, e
 	err := tx.QueryRow(ctx, `
 		SELECT update_id, chat_id, thread_id, source_message_id, input_text, kind, state,
 		       processing_owner, processing_version, response_text, telegram_message_id,
-		       delivery_owner, delivery_lease_until
+		       delivery_owner, delivery_lease_until, author_id, author_username, author_name, author_order
 		FROM processed_updates
 		WHERE update_id = $1
 		FOR UPDATE`, updateID).Scan(
 		&record.UpdateID, &record.ChatID, &record.ThreadID, &record.SourceMessageID,
 		&record.InputText, &record.Kind, &record.State, &record.ProcessingOwner,
 		&record.ProcessingVersion, &record.ResponseText, &record.TelegramMessageID,
-		&record.DeliveryOwner, &record.DeliveryLeaseUntil,
+		&record.DeliveryOwner, &record.DeliveryLeaseUntil, &record.AuthorID, &record.AuthorUsername, &record.AuthorName, &record.AuthorOrder,
 	)
 	return record, err
 }
@@ -887,7 +918,7 @@ func lockPending(ctx context.Context, tx pgx.Tx, key domain.ConversationKey, cur
 	err := tx.QueryRow(ctx, `
 		SELECT update_id, chat_id, thread_id, source_message_id, input_text, kind, state,
 		       processing_owner, processing_version, response_text, telegram_message_id,
-		       delivery_owner, delivery_lease_until
+		       delivery_owner, delivery_lease_until, author_id, author_username, author_name, author_order
 		FROM processed_updates
 		WHERE chat_id = $1 AND thread_id = $2 AND update_id <> $3
 		  AND state IN ('processing', 'ready', 'sending')
@@ -897,7 +928,7 @@ func lockPending(ctx context.Context, tx pgx.Tx, key domain.ConversationKey, cur
 		&record.UpdateID, &record.ChatID, &record.ThreadID, &record.SourceMessageID,
 		&record.InputText, &record.Kind, &record.State, &record.ProcessingOwner,
 		&record.ProcessingVersion, &record.ResponseText, &record.TelegramMessageID,
-		&record.DeliveryOwner, &record.DeliveryLeaseUntil,
+		&record.DeliveryOwner, &record.DeliveryLeaseUntil, &record.AuthorID, &record.AuthorUsername, &record.AuthorName, &record.AuthorOrder,
 	)
 	return record, err
 }
@@ -951,10 +982,13 @@ func markUnknownTx(ctx context.Context, tx pgx.Tx, update updateRecord) error {
 }
 
 func validIncoming(incoming domain.Incoming) bool {
-	return incoming.UpdateID >= 0 && incoming.Key.ChatID != 0 && incoming.Key.ThreadID >= 0 && incoming.MessageID > 0 && strings.TrimSpace(incoming.Text) != "" && len(incoming.Text) <= app.MaxConversationTextBytes && utf8.ValidString(incoming.Text) && !strings.ContainsRune(incoming.Text, '\x00') && (incoming.Kind == domain.MessageText || incoming.Kind == domain.MessageAbout)
+	return (incoming.Author == nil || (incoming.Author.ID > 0 && utf8.ValidString(incoming.Author.Username) && !strings.ContainsRune(incoming.Author.Username, '\x00'))) && incoming.UpdateID >= 0 && incoming.Key.ChatID != 0 && incoming.Key.ThreadID >= 0 && incoming.MessageID > 0 && strings.TrimSpace(incoming.Text) != "" && len(incoming.Text) <= app.MaxConversationTextBytes && utf8.ValidString(incoming.Text) && !strings.ContainsRune(incoming.Text, '\x00') && (incoming.Kind == domain.MessageText || incoming.Kind == domain.MessageAbout)
 }
 
 func matchesIncoming(record updateRecord, incoming domain.Incoming) bool {
+	if record.AuthorID.Valid && (incoming.Author == nil || record.AuthorID.Int64 != incoming.Author.ID || record.AuthorUsername.String != incoming.Author.Username || record.AuthorName.String != incoming.Author.Name) {
+		return false
+	}
 	return record.ChatID == incoming.Key.ChatID && record.ThreadID == incoming.Key.ThreadID && record.SourceMessageID == incoming.MessageID && record.InputText == incoming.Text && record.Kind == kindName(incoming.Kind)
 }
 
@@ -970,13 +1004,46 @@ func incomingFromRecord(record updateRecord) domain.Incoming {
 	if record.Kind == "about" {
 		kind = domain.MessageAbout
 	}
+	var author *domain.Author
+	if record.AuthorID.Valid {
+		author = &domain.Author{ID: record.AuthorID.Int64, Username: record.AuthorUsername.String, Name: record.AuthorName.String, Order: record.AuthorOrder.Int64}
+	}
 	return domain.Incoming{
 		UpdateID:  record.UpdateID,
 		Key:       domain.ConversationKey{ChatID: record.ChatID, ThreadID: record.ThreadID},
 		MessageID: record.SourceMessageID,
 		Text:      record.InputText,
 		Kind:      kind,
+		Author:    author,
 	}
+}
+
+func authorID(author *domain.Author) any {
+	if author == nil {
+		return nil
+	}
+	return author.ID
+}
+
+func authorUsername(author *domain.Author) any {
+	if author == nil || author.Username == "" {
+		return nil
+	}
+	return author.Username
+}
+
+func authorName(author *domain.Author) any {
+	if author == nil {
+		return nil
+	}
+	return author.Name
+}
+
+func authorOrder(author *domain.Author) any {
+	if author == nil {
+		return nil
+	}
+	return author.Order
 }
 
 func claimFromIncoming(incoming domain.Incoming, owner string, version int64) app.Claim {

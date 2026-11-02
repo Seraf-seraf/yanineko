@@ -105,11 +105,16 @@ func TestWebhookToSQLiteServiceEndToEnd(t *testing.T) {
 			0,
 		),
 	}
+	groupMention.Message.From = &telegram.User{ID: 9876543210, Username: "alice", FirstName: "Алиса"}
 	if response := serveIntegrationUpdate(t, handler, integrationWebhookSecret, groupMention); response.Code != http.StatusOK {
 		t.Fatalf("group mention status = %d, want 200", response.Code)
 	}
 	if len(responder.calls) != 2 || len(messenger.sent) != 2 || botUsernameCalls != 1 {
 		t.Fatalf("group mention path = (AI calls %d, sends %d, username lookups %d), want (2, 2, 1)", len(responder.calls), len(messenger.sent), botUsernameCalls)
+	}
+	groupHistory := responder.calls[1].history
+	if len(groupHistory) != 1 || groupHistory[0].Author == nil || groupHistory[0].Author.ID != 9876543210 || groupHistory[0].Author.Username != "alice" || groupHistory[0].Author.Name != "Алиса" || groupHistory[0].Author.Order != 1 {
+		t.Fatalf("group author after webhook and storage = %#v, want Telegram identity and first participant", groupHistory)
 	}
 
 	groupReply := integrationUpdate{

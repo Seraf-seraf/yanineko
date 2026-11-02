@@ -7,6 +7,21 @@ import (
 	"github.com/Seraf-seraf/yanineko/internal/domain"
 )
 
+func TestClassifyPreservesAuthorFromTelegramUpdate(t *testing.T) {
+	update, ok, err := ParseUpdate(strings.NewReader(`{"update_id":75,"message":{"message_id":9,"chat":{"id":-11,"type":"supergroup"},"from":{"id":9876543210123,"is_bot":false,"first_name":"Анна","last_name":"Иванова","username":"anna_name"},"caption":"@yanineko привет","photo":[{"file_id":"photo"}]}}`))
+	if err != nil || !ok {
+		t.Fatalf("ParseUpdate = %t, %v", ok, err)
+	}
+	incoming, accepted, _ := ClassifyWithReason(update, 99, "yanineko")
+	if !accepted || incoming.Author == nil || incoming.Author.ID != 9876543210123 || incoming.Author.Username != "anna_name" || incoming.Author.Name != "Анна Иванова" {
+		t.Fatalf("author = %#v, accepted %t", incoming.Author, accepted)
+	}
+	update.Message.SenderChat = &Chat{ID: -11}
+	if _, accepted, _ := ClassifyWithReason(update, 99, "yanineko"); accepted {
+		t.Fatal("sender_chat was accepted as a user")
+	}
+}
+
 func TestClassifyAcceptsPrivateMediaAndGroupCaptionMention(t *testing.T) {
 	private := Update{ID: 1, Message: &Message{
 		ID: 2, Chat: Chat{ID: 3, Type: "private"}, From: &User{ID: 4},

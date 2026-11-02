@@ -20,8 +20,17 @@ type Incoming struct {
 	MessageID        int64
 	Text             string
 	Kind             MessageKind
+	Author           *Author
 	Images           []Image
 	MediaUnavailable bool
+}
+
+// Author identifies a Telegram user independently of the conversation key.
+type Author struct {
+	ID       int64
+	Username string
+	Name     string
+	Order    int64
 }
 
 // Image is transient media prepared for visual description. It is never stored.
@@ -42,6 +51,7 @@ type Message struct {
 	ArchiveOrder int64
 	Role         Role
 	Text         string
+	Author       *Author
 }
 
 type Outgoing struct {
